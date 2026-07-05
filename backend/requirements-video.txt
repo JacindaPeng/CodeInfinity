@@ -1,0 +1,13 @@
+# 可选：视频字幕转写依赖
+# 安装命令：
+#   pip install -r requirements-video.txt
+#
+# 若 openai-whisper 在 Python 3.12 + 新 setuptools 下构建失败（No module named 'pkg_resources'），
+# 可用以下任一方式：
+#   1) pip install openai-whisper --no-build-isolation      # 用当前 env 的 setuptools 构建
+#   2) pip install "setuptools<81" && pip install openai-whisper
+#   3) 直接使用已存在的较新版本： pip install openai-whisper>=20240930
+#
+# 未安装时：后端正常启动，所有功能可用，仅视频上传后的字幕转写会失败（其它文档索引正常）。
+
+openai-whisper>=20240930

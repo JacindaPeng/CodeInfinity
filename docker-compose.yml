@@ -1,0 +1,26 @@
+services:
+  backend:
+    build: ./backend
+    container_name: ccourse-backend
+    environment:
+      - LLM_DEFAULT_PROVIDER=deepseek
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production-please-use-a-long-random-string}
+      - SQLITE_PATH=/data/course.db
+      - CHROMA_PATH=/data/chroma
+      - UPLOAD_DIR=/data/uploads
+      - CORS_ORIGINS=http://localhost,http://localhost:5173
+    volumes:
+      - ./data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: ccourse-frontend
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    restart: unless-stopped
