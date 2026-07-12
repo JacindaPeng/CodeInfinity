@@ -1,16 +1,15 @@
-"""LLM 提供方抽象 + DeepSeek/OpenAI/Qwen 实现。
+"""LLM 提供方抽象 + OpenAI 兼容协议实现。
 
-三者均兼容 OpenAI Chat Completions 协议，统一用 httpx 调用 /chat/completions (stream=true)。
+各厂商若兼容 OpenAI Chat Completions，统一用 httpx 调用 /chat/completions (stream=true)。
 """
 from __future__ import annotations
 
-import time
-from typing import AsyncGenerator, Iterator
+from typing import AsyncGenerator
 
 import httpx
 from sqlalchemy import select
 
-from ..config import settings
+from ..config import Settings, settings
 from ..database import SessionLocal
 from ..models import LLMConfig
 
@@ -40,7 +39,7 @@ class LLMProvider:
 
 
 class OpenAICompatibleProvider(LLMProvider):
-    """OpenAI 兼容协议实现（DeepSeek/OpenAI/Qwen 通用）。"""
+    """OpenAI 兼容协议实现（DeepSeek/OpenAI/Qwen 等通用）。"""
 
     async def stream_chat(self, messages: list[dict]) -> AsyncGenerator[str, None]:
         url = f"{self.base_url}/chat/completions"
@@ -73,25 +72,43 @@ class OpenAICompatibleProvider(LLMProvider):
                         continue
 
 
-# ---- 工厂 ----
+# ---- 提供商注册表 ----
 
-_BUILTIN = {
-    "deepseek": lambda c: OpenAICompatibleProvider(
-        c.api_key or settings.deepseek_api_key,
-        c.base_url or settings.deepseek_base_url,
-        c.model or settings.deepseek_model,
-    ),
-    "openai": lambda c: OpenAICompatibleProvider(
-        c.api_key or settings.openai_api_key,
-        c.base_url or settings.openai_base_url,
-        c.model or settings.openai_model,
-    ),
-    "qwen": lambda c: OpenAICompatibleProvider(
-        c.api_key or settings.qwen_api_key,
-        c.base_url or settings.qwen_base_url,
-        c.model or settings.qwen_model,
-    ),
-}
+_PROVIDER_SPECS: list[tuple[str, str, str, str, str]] = [
+    # (id, 显示名, api_key 字段, base_url 字段, model 字段)
+    ("deepseek", "DeepSeek", "deepseek_api_key", "deepseek_base_url", "deepseek_model"),
+    ("qwen", "通义千问 Qwen", "qwen_api_key", "qwen_base_url", "qwen_model"),
+    ("openai", "OpenAI (Jeniya)", "openai_api_key", "openai_base_url", "openai_model"),
+    ("gemini", "Google Gemini (Jeniya)", "gemini_api_key", "gemini_base_url", "gemini_model"),
+    ("claude", "Claude (Jeniya)", "claude_api_key", "claude_base_url", "claude_model"),
+    ("moonshot", "月之暗面 Kimi", "moonshot_api_key", "moonshot_base_url", "moonshot_model"),
+    ("zhipu", "智谱 GLM", "zhipu_api_key", "zhipu_base_url", "zhipu_model"),
+]
+
+
+def _provider_defaults(provider_id: str, cfg: Settings | LLMConfig | None = None) -> tuple[str, str, str]:
+    for pid, _, key_attr, url_attr, model_attr in _PROVIDER_SPECS:
+        if pid == provider_id:
+            if cfg is None:
+                cfg = settings
+            api_key = getattr(cfg, key_attr, "") if hasattr(cfg, key_attr) else ""
+            base_url = getattr(cfg, url_attr, "")
+            model = getattr(cfg, model_attr, "")
+            return api_key, base_url, model
+    return "", "", ""
+
+
+def _make_provider(provider_id: str, cfg: LLMConfig | Settings) -> LLMProvider:
+    env_key, env_url, env_model = _provider_defaults(provider_id, settings)
+    api_key = getattr(cfg, "api_key", None) or env_key
+    base_url = getattr(cfg, "base_url", None) or env_url
+    model = getattr(cfg, "model", None) or env_model
+    if not api_key or not base_url or not model:
+        # 未知 provider 或未配置时回退 deepseek 环境变量
+        api_key = api_key or settings.deepseek_api_key
+        base_url = base_url or settings.deepseek_base_url
+        model = model or settings.deepseek_model
+    return OpenAICompatibleProvider(api_key, base_url, model)
 
 
 def get_provider(provider: str | None = None, config_id: int | None = None) -> LLMProvider:
@@ -102,28 +119,23 @@ def get_provider(provider: str | None = None, config_id: int | None = None) -> L
         if config_id is not None:
             cfg = db.get(LLMConfig, config_id)
         if cfg is None:
-            # 取默认配置
             cfg = db.scalar(select(LLMConfig).where(LLMConfig.is_default.is_(True)))
         if cfg is None:
-            # 退化到环境变量
             target = provider or settings.llm_default_provider
-            key_map = {
-                "deepseek": (settings.deepseek_api_key, settings.deepseek_base_url, settings.deepseek_model),
-                "openai": (settings.openai_api_key, settings.openai_base_url, settings.openai_model),
-                "qwen": (settings.qwen_api_key, settings.qwen_base_url, settings.qwen_model),
-            }
-            k, b, m = key_map.get(target, key_map["deepseek"])
-            return OpenAICompatibleProvider(k, b, m)
+            return _make_provider(target, settings)
         target = provider or cfg.provider
-        factory = _BUILTIN.get(target, _BUILTIN["deepseek"])
-        return factory(cfg)
+        return _make_provider(target, cfg)
     finally:
         db.close()
 
 
 def list_available_providers() -> list[dict]:
     return [
-        {"provider": "deepseek", "label": "DeepSeek", "default_model": settings.deepseek_model, "base_url": settings.deepseek_base_url},
-        {"provider": "openai", "label": "OpenAI", "default_model": settings.openai_model, "base_url": settings.openai_base_url},
-        {"provider": "qwen", "label": "通义千问 Qwen", "default_model": settings.qwen_model, "base_url": settings.qwen_base_url},
+        {
+            "provider": pid,
+            "label": label,
+            "default_model": getattr(settings, model_attr),
+            "base_url": getattr(settings, url_attr),
+        }
+        for pid, label, _key, url_attr, model_attr in _PROVIDER_SPECS
     ]

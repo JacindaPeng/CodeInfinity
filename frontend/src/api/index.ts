@@ -15,7 +15,12 @@ http.interceptors.request.use((config) => {
 http.interceptors.response.use(
   (resp) => resp,
   (err) => {
-    const msg = err?.response?.data?.detail || err.message || '请求失败'
+    let msg = err?.response?.data?.detail || err.message || '请求失败'
+    if (err?.code === 'ECONNABORTED' || /timeout/i.test(err?.message || '')) {
+      msg = '请求超时：后端可能正在重启或未启动，请稍候再试或运行 backend\\dev.bat'
+    } else if (!err?.response) {
+      msg = '无法连接后端服务，请确认 backend 已在 8000 端口运行'
+    }
     if (err?.response?.status === 401) {
       localStorage.removeItem('token')
       if (location.pathname !== '/login') location.href = '/login'

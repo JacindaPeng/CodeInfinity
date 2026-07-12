@@ -2,7 +2,7 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from ..deps import CurrentUser, DBSession
+from ..deps import CurrentUser, DBSession, resolve_resource_class_ids
 from ..services import recommend_service
 
 router = APIRouter(prefix="/recommend", tags=["recommend"])
@@ -15,7 +15,8 @@ class RecommendIn(BaseModel):
 
 
 @router.post("")
-def recommend(payload: RecommendIn, _u: CurrentUser, db: DBSession) -> list[dict]:
+def recommend(payload: RecommendIn, user: CurrentUser, db: DBSession) -> list[dict]:
+    class_ids = resolve_resource_class_ids(db, user)
     return recommend_service.recommend_by_question(
-        db, payload.question, payload.chapter_id, payload.k
+        db, payload.question, payload.chapter_id, payload.k, class_ids=class_ids
     )

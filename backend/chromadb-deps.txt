@@ -1,0 +1,31 @@
+# chromadb 0.5.23 的依赖清单（已排除 chroma-hnswlib，因为它单独用预编译 wheel 安装）。
+# 安装顺序：先 chroma-hnswlib==0.7.5（wheel），再本文件，再 chromadb==0.5.23 --no-deps。
+# 见 install.bat。
+
+build>=1.0.3
+pydantic>=1.9
+fastapi>=0.95.2
+uvicorn[standard]>=0.18.3
+numpy>=1.22.5
+posthog>=2.4.0
+typing_extensions>=4.5.0
+onnxruntime>=1.14.1
+opentelemetry-api>=1.2.0
+opentelemetry-exporter-otlp-proto-grpc>=1.2.0
+opentelemetry-instrumentation-fastapi>=0.41b0
+opentelemetry-sdk>=1.2.0
+tokenizers<=0.20.3,>=0.13.2
+pypika>=0.48.9
+tqdm>=4.65.0
+overrides>=7.3.1
+importlib-resources
+grpcio>=1.58.0
+bcrypt>=4.0.1
+typer>=0.9.0
+kubernetes>=28.1.0
+tenacity>=8.2.3
+PyYAML>=6.0.0
+mmh3>=4.0.1
+orjson>=3.9.12
+httpx>=0.27.0
+rich>=10.11.0

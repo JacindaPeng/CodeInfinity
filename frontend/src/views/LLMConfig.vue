@@ -66,8 +66,26 @@ async function submit() {
   } catch {}
 }
 
+async function setDefault(row: Cfg) {
+  if (row.is_default) return
+  try {
+    await http.put(`/llm-configs/${row.id}`, {
+      provider: row.provider,
+      api_key: row.api_key,
+      base_url: row.base_url,
+      model: row.model,
+      is_default: true,
+    })
+    ElMessage.success(`已将 ${providerLabel(row.provider)} 设为默认模型`)
+    await load()
+  } catch {}
+}
+
 async function remove(row: Cfg) {
-  await ElMessageBox.confirm(`删除 ${row.provider} 配置？`, '提示', { type: 'warning' })
+  const tip = row.is_default
+    ? `「${providerLabel(row.provider)}」是当前默认模型，删除后系统将无默认配置，确定删除？`
+    : `删除 ${providerLabel(row.provider)} 配置？`
+  await ElMessageBox.confirm(tip, '提示', { type: 'warning' })
   await http.delete(`/llm-configs/${row.id}`)
   ElMessage.success('已删除')
   load()
@@ -99,12 +117,13 @@ onMounted(load)
           <span>{{ row.api_key ? row.api_key.slice(0, 6) + '••••' : '未设置' }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="默认" width="80">
+      <el-table-column label="默认" width="100" align="center">
         <template #default="{ row }">
           <el-tag v-if="row.is_default" type="success">默认</el-tag>
+          <el-button v-else text type="primary" @click="setDefault(row)">设为默认</el-button>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="160">
+      <el-table-column label="操作" width="140">
         <template #default="{ row }">
           <el-button text type="primary" @click="openEdit(row)">编辑</el-button>
           <el-button text type="danger" @click="remove(row)">删除</el-button>
@@ -130,6 +149,7 @@ onMounted(load)
         </el-form-item>
         <el-form-item label="设为默认">
           <el-switch v-model="form.is_default" />
+          <span style="margin-left: 8px; color: #909399; font-size: 12px">开启后，对话/问答/考核将优先使用此模型</span>
         </el-form-item>
       </el-form>
       <template #footer>

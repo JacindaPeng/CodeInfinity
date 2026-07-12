@@ -13,6 +13,7 @@ from typing import Any
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from ..config import settings
+from ..utils.ffmpeg_path import ensure_ffmpeg_on_path, resolve_ffmpeg
 
 _splitter = RecursiveCharacterTextSplitter(
     chunk_size=400, chunk_overlap=40,
@@ -34,10 +35,14 @@ def _get_whisper_model():
 
 def extract_audio(video_path: str) -> str:
     """用 ffmpeg 抽取 16k 单声道 wav。"""
+    ffmpeg = resolve_ffmpeg(settings.ffmpeg_path or None)
+    if not ffmpeg:
+        raise RuntimeError("未找到 ffmpeg，请安装后重启后端")
+    ensure_ffmpeg_on_path(settings.ffmpeg_path or None)
     out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     out.close()
     cmd = [
-        "ffmpeg", "-y", "-i", video_path,
+        ffmpeg, "-y", "-i", video_path,
         "-ar", "16000", "-ac", "1", "-f", "wav", out.name,
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

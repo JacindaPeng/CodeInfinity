@@ -5,6 +5,8 @@ export interface UserOut {
   username: string
   role: string
   display_name: string
+  class_id: number | null
+  class_name: string | null
   created_at: string
 }
 

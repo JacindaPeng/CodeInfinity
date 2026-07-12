@@ -1,17 +1,18 @@
 """章节考核服务：试卷生成 / 评分 / 评价报告。
 
 生成策略：题库优先抽题；不足题型用 LLM 基于章节知识点动态补足。
-评分策略：客观题直接判，简答题用 LLM 按「标准答案 + 维度」打分。
-报告策略：LLM 按 4 维度生成评价。
+评分策略：客观题提取首字母比对；简答题用 LLM 按「标准答案 + 维度」打分。
+报告策略：LLM 按 3 维度生成评价 + 薄弱知识点列表 + 总分持久化。
 """
 from __future__ import annotations
 
 import json
 import random
+import re
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -25,13 +26,17 @@ from ..models import (
     QuestionBank,
     User,
 )
+from ..deps import get_exam_config
 from .llm_provider import get_provider
 
 TYPE_LABEL = {"选择题": "选择题", "判断题": "判断题", "简答题": "简答题"}
 
 
-def _get_kp_names(db: Session, chapter_id: int) -> list[str]:
-    rows = db.scalars(select(KnowledgePoint).where(KnowledgePoint.chapter_id == chapter_id)).all()
+def _get_kp_names(db: Session, chapter_id: int, class_id: int | None = None) -> list[str]:
+    q = select(KnowledgePoint).where(KnowledgePoint.chapter_id == chapter_id)
+    if class_id:
+        q = q.where(KnowledgePoint.class_id == class_id)
+    rows = db.scalars(q).all()
     return [r.name for r in rows]
 
 
@@ -54,7 +59,6 @@ def _llm_generate_questions(
     provider = get_provider()
     raw = _run_sync(provider, [{"role": "user", "content": prompt}])
     raw = raw.strip()
-    # 容错：剥离 markdown 代码块
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"): raw = raw[4:]
@@ -63,7 +67,6 @@ def _llm_generate_questions(
     try:
         items = json.loads(raw)
     except json.JSONDecodeError:
-        # 退化：尝试找到第一个 [ 到最后一个 ]
         try:
             s = raw[raw.index("["):raw.rindex("]") + 1]
             items = json.loads(s)
@@ -89,7 +92,6 @@ def _run_sync(provider, messages: list[dict]) -> str:
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # 已在事件循环中（FastAPI sync 路由会在 threadpool），新建 loop
             import threading
             result: list[str] = []
             def _run():
@@ -105,55 +107,93 @@ def _run_sync(provider, messages: list[dict]) -> str:
     return asyncio.run(provider.chat(messages))
 
 
-def generate_paper(db: Session, user: User, chapter_id: int) -> Exam:
-    """按章节考核配置生成试卷。"""
+def generate_paper(
+    db: Session,
+    user: User,
+    chapter_id: int,
+    class_id: int | None = None,
+    *,
+    teacher_test: bool = False,
+) -> tuple[Exam, list[str]]:
+    """按章节考核配置生成试卷。返回 (exam, warnings)。"""
     chapter = db.get(Chapter, chapter_id)
     if not chapter:
         raise ValueError("章节不存在")
-    cfg = db.scalar(select(ExamConfig).where(ExamConfig.chapter_id == chapter_id))
+    effective_class_id = class_id or user.class_id
+    if not effective_class_id:
+        raise ValueError("尚未加入班级，无法开始考核")
+    cfg = get_exam_config(db, chapter_id, effective_class_id)
     if not cfg:
-        raise ValueError("该章节未配置考核")
+        raise ValueError("该章节未为本班配置考核")
+
+    # 检查考核次数上限（教师测试不受限）
+    if not teacher_test and cfg.max_attempts and cfg.max_attempts > 0:
+        existing_count = db.scalar(
+            select(func.count()).select_from(
+                select(Exam).where(
+                    Exam.user_id == user.id,
+                    Exam.chapter_id == chapter_id,
+                ).subquery()
+            )
+        ) or 0
+        if existing_count >= cfg.max_attempts:
+            raise ValueError(f"该章节考核次数已达上限（{cfg.max_attempts}次），无法再次开考")
 
     config: dict[str, Any] = cfg.config_json or {}
-    kp_names = config.get("knowledge_points") or _get_kp_names(db, chapter_id)
+    kp_names = config.get("knowledge_points") or _get_kp_names(db, chapter_id, effective_class_id)
+    warnings: list[str] = []
 
     exam = Exam(user_id=user.id, chapter_id=chapter_id, status="ongoing")
     db.add(exam); db.flush()
 
     idx = 0
+    bank_class_filter = [QuestionBank.class_id == effective_class_id]
     for qtype, count in config.items():
         if qtype == "knowledge_points" or not isinstance(count, int):
             continue
-        # 1) 题库抽题
         bank_rows = db.scalars(
             select(QuestionBank).where(
                 QuestionBank.chapter_id == chapter_id,
                 QuestionBank.type == qtype,
+                *bank_class_filter,
             )
         ).all()
         random.shuffle(bank_rows)
         needed = count
         for bq in bank_rows[:needed]:
             idx += 1
+            # 查知识点名
+            kp = db.get(KnowledgePoint, bq.kp_id) if bq.kp_id else None
             db.add(ExamQuestion(
                 exam_id=exam.id, idx=idx, source="bank", type=qtype,
                 stem=bq.stem, options_json=bq.options_json or [],
                 correct_answer=bq.answer, user_answer="", is_correct=None,
+                analysis=bq.analysis or "",
+                kp_name=kp.name if kp else "",
             ))
         shortfall = needed - len(bank_rows[:needed])
-        # 2) LLM 补足
         if shortfall > 0:
-            gen = _llm_generate_questions(db, chapter, qtype, shortfall, kp_names)
+            try:
+                gen = _llm_generate_questions(db, chapter, qtype, shortfall, kp_names)
+            except Exception as e:
+                gen = []
+                warnings.append(f"{qtype} LLM 生成失败: {e}")
+            if len(gen) < shortfall:
+                warnings.append(f"{qtype} 题量不足：需 {needed} 道，题库 {len(bank_rows)} 道，LLM 生成 {len(gen)} 道，缺 {shortfall - len(gen)} 道")
             for g in gen:
                 idx += 1
                 db.add(ExamQuestion(
                     exam_id=exam.id, idx=idx, source="llm", type=qtype,
                     stem=g["stem"], options_json=g.get("options_json", []),
                     correct_answer=g.get("correct_answer", ""), user_answer="",
+                    analysis=g.get("analysis", ""),
+                    kp_name="",
                 ))
+    if idx == 0:
+        warnings.append("试卷无题目，请检查题库与考核配置")
     db.commit()
     db.refresh(exam)
-    return exam
+    return exam, warnings
 
 
 def save_answer(db: Session, exam: Exam, idx: int, answer: str) -> None:
@@ -165,9 +205,28 @@ def save_answer(db: Session, exam: Exam, idx: int, answer: str) -> None:
         db.commit()
 
 
+def _normalize_answer(ans: str) -> str:
+    """提取答案关键标识：选择题取首字母(A/B/C/D)，判断题取「对/错」。"""
+    ans = (ans or "").strip()
+    if not ans:
+        return ""
+    # 选择题：A / A. xxx / A、xxx → A
+    m = re.match(r"^([A-Da-d])[\s.、．:：]?", ans)
+    if m:
+        return m.group(1).upper()
+    # 判断题
+    if ans in ("对", "正确", "T", "True", "true", "√"):
+        return "对"
+    if ans in ("错", "错误", "F", "False", "false", "×"):
+        return "错"
+    return ans.strip().upper()
+
+
 def _grade_objective(q: ExamQuestion) -> tuple[bool, float]:
-    correct = (q.user_answer or "").strip().upper() == (q.correct_answer or "").strip().upper()
-    return correct, 100.0 if correct else 0.0
+    user = _normalize_answer(q.user_answer or "")
+    correct = _normalize_answer(q.correct_answer or "")
+    ok = user == correct
+    return ok, 100.0 if ok else 0.0
 
 
 def _grade_subjective(db: Session, q: ExamQuestion) -> tuple[bool, float, str]:
@@ -225,22 +284,34 @@ def grade_exam(db: Session, exam: Exam) -> Exam:
     return exam
 
 
+def compute_total_score(exam: Exam) -> float:
+    """计算总分（各题 ai_score 平均值）。"""
+    scores = [q.ai_score or 0 for q in exam.questions]
+    return round(sum(scores) / max(len(scores), 1), 1)
+
+
 def generate_report(db: Session, exam: Exam) -> ExamReport:
-    """生成 4 维度学习评价报告。"""
+    """生成 3 维度学习评价报告 + 薄弱知识点 + 总分。"""
     chapter = db.get(Chapter, exam.chapter_id)
+    total_score = compute_total_score(exam)
     q_summary = "\n".join([
-        f"[{q.type}] 题:{q.stem[:60]}\n  学生答:{q.user_answer[:60]}\n  正确答:{q.correct_answer[:60]}\n  得分:{q.ai_score} 评语:{q.ai_feedback[:60]}"
+        f"[{q.type}] 题:{q.stem[:60]}\n  学生答:{(q.user_answer or '')[:60]}\n  正确答:{q.correct_answer[:60]}\n  得分:{q.ai_score} 评语:{(q.ai_feedback or '')[:60]}"
         for q in exam.questions
     ])
+    # 收集错题对应知识点
+    wrong_kps = [q.stem[:30] for q in exam.questions if q.is_correct is False]
+
     prompt = f"""你是C语言课程学习评价助手。基于以下学生考核作答情况，生成学习评价报告。
 
 章节：{chapter.title if chapter else ''}
+总分：{total_score}
 作答明细：
 {q_summary}
 
-请按以下 4 个维度输出 JSON：
+请按以下 JSON 格式输出：
 {{
-  "dimensions": {{"知识掌握情况": 0-100, "基础概念掌握": 0-100, "综合分析能力": 0-100, "建议复习知识点": 0-100}},
+  "dimensions": {{"知识掌握情况": 0-100, "基础概念掌握": 0-100, "综合应用能力": 0-100}},
+  "weak_points": ["薄弱知识点1", "薄弱知识点2", ...],
   "summary": "总体评价，2-3句",
   "suggestions": "建议复习的知识点与学习方向，3-5条要点"
 }}
@@ -257,16 +328,27 @@ def generate_report(db: Session, exam: Exam) -> ExamReport:
     try:
         obj = json.loads(raw)
         dimensions = obj.get("dimensions", {})
+        weak_points = obj.get("weak_points", [])
         summary = obj.get("summary", "")
         suggestions = obj.get("suggestions", "")
+        # LLM 可能返回 list 而非 str，统一转为字符串
+        if isinstance(summary, list):
+            summary = " ".join(str(s) for s in summary)
+        if isinstance(suggestions, list):
+            suggestions = "\n".join(f"• {s}" for s in suggestions)
+        if not isinstance(summary, str):
+            summary = str(summary)
+        if not isinstance(suggestions, str):
+            suggestions = str(suggestions)
+        if not isinstance(weak_points, list):
+            weak_points = [str(weak_points)] if weak_points else []
     except Exception:
-        # 退化：按平均分计算
         scores = [q.ai_score or 0 for q in exam.questions]
         avg = sum(scores) / max(len(scores), 1)
         dimensions = {
-            "知识掌握情况": avg, "基础概念掌握": avg,
-            "综合分析能力": avg, "建议复习知识点": avg,
+            "知识掌握情况": avg, "基础概念掌握": avg, "综合应用能力": avg,
         }
+        weak_points = wrong_kps[:5]
         summary = "评价生成失败，已按平均分估算。"
         suggestions = "建议复习错题对应知识点。"
 
@@ -275,10 +357,60 @@ def generate_report(db: Session, exam: Exam) -> ExamReport:
         report.dimensions_json = dimensions
         report.summary = summary
         report.suggestions = suggestions
+        report.total_score = total_score
+        report.weak_points = weak_points
     else:
         report = ExamReport(
             exam_id=exam.id, dimensions_json=dimensions,
             summary=summary, suggestions=suggestions,
+            total_score=total_score, weak_points=weak_points,
+        )
+        db.add(report)
+
+    # 更新章节进度
+    p = db.scalar(select(ChapterProgress).where(
+        ChapterProgress.user_id == exam.user_id,
+        ChapterProgress.chapter_id == exam.chapter_id,
+    ))
+    if not p:
+        p = ChapterProgress(user_id=exam.user_id, chapter_id=exam.chapter_id)
+        db.add(p)
+    p.status = "已完成"
+    p.last_exam_id = exam.id
+
+    db.commit()
+    db.refresh(report)
+    return report
+
+
+def generate_fallback_report(db: Session, exam: Exam, error_msg: str = "") -> ExamReport:
+    """生成降级报告（不调用 LLM，仅基于评分数据）。用于 generate_report 失败时兜底。"""
+    total_score = compute_total_score(exam)
+    scores = [q.ai_score or 0 for q in exam.questions]
+    avg = sum(scores) / max(len(scores), 1)
+    wrong_kps = [q.kp_name or q.stem[:20] for q in exam.questions if q.is_correct is False and q.kp_name]
+    wrong_kps = list(dict.fromkeys(wrong_kps))[:5]  # 去重取前5
+
+    dimensions = {
+        "知识掌握情况": avg,
+        "基础概念掌握": avg,
+        "综合应用能力": avg,
+    }
+    summary = f"评价报告生成失败（{error_msg[:50]}），已按评分数据生成基础报告。总分 {total_score}。"
+    suggestions = "建议复习以下错题对应的知识点：" + "、".join(wrong_kps) if wrong_kps else "建议复习错题对应知识点。"
+
+    report = db.scalar(select(ExamReport).where(ExamReport.exam_id == exam.id))
+    if report:
+        report.dimensions_json = dimensions
+        report.summary = summary
+        report.suggestions = suggestions
+        report.total_score = total_score
+        report.weak_points = wrong_kps
+    else:
+        report = ExamReport(
+            exam_id=exam.id, dimensions_json=dimensions,
+            summary=summary, suggestions=suggestions,
+            total_score=total_score, weak_points=wrong_kps,
         )
         db.add(report)
 
@@ -308,10 +440,11 @@ def exam_to_dict(exam: Exam) -> dict:
                 "idx": q.idx, "source": q.source, "type": q.type,
                 "stem": q.stem, "options": q.options_json or [],
                 "user_answer": q.user_answer,
-                # 提交后才返回答案与评分
+                "kp_name": q.kp_name or "",
                 **(
                     {"correct_answer": q.correct_answer, "is_correct": q.is_correct,
-                     "ai_score": q.ai_score, "ai_feedback": q.ai_feedback}
+                     "ai_score": q.ai_score, "ai_feedback": q.ai_feedback,
+                     "analysis": q.analysis or ""}
                     if exam.status == "submitted" else {}
                 ),
             }

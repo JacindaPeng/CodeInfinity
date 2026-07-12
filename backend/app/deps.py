@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import get_db
-from .models import CallLog, User
+from .models import CallLog, ClassTeacher, ExamConfig, Material, QuestionBank, User
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
@@ -25,6 +25,10 @@ def get_current_user(
     token: Annotated[str | None, Depends(oauth2_scheme)],
     db: Annotated[Session, Depends(get_db)],
 ) -> User:
+    return user_from_access_token(token, db)
+
+
+def user_from_access_token(token: str | None, db: Session) -> User:
     cred_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="未认证或凭证已过期",
@@ -52,6 +56,161 @@ def require_role(*roles: str):
     return _dep
 
 
+def get_managed_class_ids(db: Session, user: User) -> list[int] | None:
+    """admin 返回 None（不限制）；teacher 返回所管班级 id 列表。"""
+    if user.role == "admin":
+        return None
+    if user.role != "teacher":
+        return []
+    rows = db.scalars(
+        select(ClassTeacher.class_id).where(ClassTeacher.user_id == user.id)
+    ).all()
+    return list(rows)
+
+
+def get_class_student_ids(db: Session, class_ids: list[int]) -> list[int]:
+    if not class_ids:
+        return []
+    rows = db.scalars(
+        select(User.id).where(User.role == "student", User.class_id.in_(class_ids))
+    ).all()
+    return list(rows)
+
+
+def resolve_teacher_scope(
+    db: Session,
+    user: User,
+    class_id: int | None = None,
+) -> tuple[list[int] | None, list[int]]:
+    """返回 (managed_class_ids, allowed_student_ids)。admin 不限制学生。"""
+    managed = get_managed_class_ids(db, user)
+    if managed is None:
+        if class_id:
+            return None, get_class_student_ids(db, [class_id])
+        return None, []
+    if not managed:
+        return managed, []
+    if class_id:
+        if class_id not in managed:
+            raise HTTPException(status_code=403, detail="无权访问该班级")
+        return managed, get_class_student_ids(db, [class_id])
+    return managed, get_class_student_ids(db, managed)
+
+
+def assert_teacher_manages_class(db: Session, user: User, class_id: int) -> None:
+    if user.role == "admin":
+        return
+    managed = get_managed_class_ids(db, user)
+    if not managed or class_id not in managed:
+        raise HTTPException(status_code=403, detail="无权管理该班级")
+
+
+def assert_teacher_can_view_student(db: Session, user: User, student_id: int) -> None:
+    if user.role == "admin":
+        return
+    student = db.get(User, student_id)
+    if not student or student.role != "student" or not student.class_id:
+        raise HTTPException(status_code=403, detail="无权查看该学生")
+    assert_teacher_manages_class(db, user, student.class_id)
+
+
+def resolve_resource_class_ids(
+    db: Session,
+    user: User,
+    class_id: int | None = None,
+) -> list[int] | None:
+    """资料/题库可见班级范围。admin 返回 None（不限制）；其余返回班级 id 列表。"""
+    if user.role == "admin":
+        if class_id:
+            return [class_id]
+        return None
+    if user.role == "teacher":
+        managed = get_managed_class_ids(db, user) or []
+        if not managed:
+            return []
+        if class_id:
+            if class_id not in managed:
+                raise HTTPException(status_code=403, detail="无权访问该班级")
+            return [class_id]
+        return managed
+    if user.role == "student":
+        if not user.class_id:
+            return []
+        return [user.class_id]
+    return []
+
+
+def assert_teacher_upload_class(db: Session, user: User, class_id: int) -> None:
+    """教师上传资料/题库时必须指定且有权管理的班级。"""
+    if user.role == "admin":
+        return
+    assert_teacher_manages_class(db, user, class_id)
+
+
+def assert_can_access_class_resource(
+    db: Session,
+    user: User,
+    resource_class_id: int | None,
+) -> None:
+    """校验用户能否访问带 class_id 的资料或题库条目。"""
+    if user.role == "admin":
+        return
+    allowed = resolve_resource_class_ids(db, user)
+    if allowed is None:
+        return
+    if not resource_class_id or resource_class_id not in allowed:
+        raise HTTPException(status_code=403, detail="无权访问该资源")
+
+
+def assert_can_access_material(db: Session, user: User, material: Material) -> None:
+    assert_can_access_class_resource(db, user, material.class_id)
+
+
+def assert_can_access_question(db: Session, user: User, question: QuestionBank) -> None:
+    assert_can_access_class_resource(db, user, question.class_id)
+
+
+def resolve_config_class_id(
+    db: Session,
+    user: User,
+    class_id: int | None = None,
+) -> int:
+    """考核配置/知识点/开考使用的单一班级 id。学生取所在班；教师/admin 需指定 class_id。"""
+    if user.role == "student":
+        if not user.class_id:
+            raise HTTPException(status_code=400, detail="尚未加入班级，无法使用考核功能")
+        return user.class_id
+    if user.role == "teacher":
+        managed = get_managed_class_ids(db, user) or []
+        if not managed:
+            raise HTTPException(status_code=403, detail="无权管理任何班级")
+        if not class_id:
+            raise HTTPException(status_code=400, detail="请指定班级")
+        if class_id not in managed:
+            raise HTTPException(status_code=403, detail="无权访问该班级")
+        return class_id
+    if user.role == "admin":
+        if not class_id:
+            raise HTTPException(status_code=400, detail="请指定班级")
+        return class_id
+    raise HTTPException(status_code=403, detail="权限不足")
+
+
+def get_exam_config(
+    db: Session,
+    chapter_id: int,
+    class_id: int | None,
+) -> ExamConfig | None:
+    if not class_id:
+        return None
+    return db.scalar(
+        select(ExamConfig).where(
+            ExamConfig.chapter_id == chapter_id,
+            ExamConfig.class_id == class_id,
+        )
+    )
+
+
 def log_call(
     db: Session,
     endpoint: str,
@@ -59,12 +218,18 @@ def log_call(
     req_summary: str = "",
     resp_summary: str = "",
     tokens: int = 0,
+    model_name: str = "",
+    answer_full: str = "",
+    attachments_json: str = "",
     latency_ms: int = 0,
 ) -> None:
     db.add(CallLog(
         user_id=user_id, endpoint=endpoint,
-        req_summary=req_summary[:500], resp_summary=resp_summary[:500],
-        tokens=tokens, latency_ms=latency_ms,
+        req_summary=req_summary[:2000], resp_summary=resp_summary[:500],
+        tokens=tokens, model_name=model_name[:128],
+        answer_full=answer_full[:50000],
+        attachments_json=attachments_json[:200000],
+        latency_ms=latency_ms,
     ))
     db.commit()
 

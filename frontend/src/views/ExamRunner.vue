@@ -17,18 +17,38 @@ const questions = ref<Question[]>([])
 const current = ref(0)
 const answers = ref<Record<number, string>>({})
 const submitting = ref(false)
+const examStatus = ref<string>('')
 
 const cur = computed(() => questions.value[current.value])
 
 async function load() {
-  // 优先用 sessionStorage（开始考核时暂存）
+  // 始终从 API 加载（获取最新已保存的答案）
+  // sessionStorage 缓存仅在创建考核后首次进入时用于避免重复请求，
+  // 但恢复进行中的考核时必须从 API 获取已保存的答案
   const cached = sessionStorage.getItem(`exam-${examId}`)
   if (cached) {
-    questions.value = JSON.parse(cached)
-    return
+    // 有缓存：检查是否有已保存的答案
+    const obj = JSON.parse(cached)
+    const cachedQs = obj.questions || obj
+    const hasSavedAnswers = cachedQs.some((q: any) => q.user_answer && q.user_answer.trim())
+    if (hasSavedAnswers) {
+      // 缓存中有答案，使用缓存
+      questions.value = cachedQs
+      questions.value.forEach(q => {
+        if (q.user_answer) answers.value[q.idx] = q.user_answer
+      })
+      return
+    }
+    // 缓存中无答案，可能是刚创建的，改为从 API 加载以获取最新状态
+    sessionStorage.removeItem(`exam-${examId}`)
   }
+
   const { data } = await http.get(`/exams/${examId}`)
   questions.value = data.questions
+  // 回填已有答案（刷新/恢复）
+  questions.value.forEach(q => {
+    if (q.user_answer) answers.value[q.idx] = q.user_answer
+  })
 }
 
 async function saveCurrent() {
@@ -86,6 +106,14 @@ onMounted(load)
         <span>已答 {{ answeredCount }} / {{ questions.length }}</span>
       </div>
     </template>
+
+    <el-alert
+      v-if="answeredCount > 0"
+      type="info"
+      :closable="false"
+      style="margin-bottom: 12px"
+      :title="`已恢复之前的答题进度（${answeredCount}/${questions.length}题已答）`"
+    />
 
     <el-progress :percentage="progressPct" style="margin-bottom: 16px" />
 

@@ -1,21 +1,18 @@
 """Chroma 向量库封装：持久化、嵌入、增删查。
 
-使用 sentence-transformers (all-MiniLM-L6-v2) 本地嵌入，无需 API。
+使用 chromadb 默认 embedding function（基于 onnxruntime 的 all-MiniLM-L6-v2 ONNX 版），
+无需 sentence-transformers / transformers 额外依赖，避免 tokenizers 版本冲突。
+首次使用时 chromadb 会自动下载 ONNX 模型到本地缓存。
 """
 from __future__ import annotations
 
 from typing import Any
 
 import chromadb
-from chromadb.utils import embedding_functions
 
 from ..config import settings
 
 COLLECTION = "course_knowledge"
-
-_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
-)
 
 _client: chromadb.api.ClientAPI | None = None
 
@@ -30,8 +27,9 @@ def get_client() -> chromadb.api.ClientAPI:
 
 
 def get_collection() -> chromadb.api.Collection:
+    # 不传 embedding_function，使用 chromadb 默认（ONNX MiniLM-L6-V2）
     return get_client().get_or_create_collection(
-        name=COLLECTION, embedding_function=_ef, metadata={"hnsw:space": "cosine"}
+        name=COLLECTION, metadata={"hnsw:space": "cosine"}
     )
 
 
@@ -76,8 +74,17 @@ def query(question: str, n_results: int = 5, where: dict | None = None) -> list[
             for d, m, dist in zip(docs, metas, dists)]
 
 
-def count() -> int:
+def count(class_ids: list[int] | None = None) -> int:
     try:
-        return get_collection().count()
+        col = get_collection()
+        if class_ids is None:
+            return col.count()
+        if not class_ids:
+            return 0
+        if len(class_ids) == 1:
+            where = {"class_id": str(class_ids[0])}
+        else:
+            where = {"class_id": {"$in": [str(c) for c in class_ids]}}
+        return col.count(where=where)
     except Exception:
         return 0

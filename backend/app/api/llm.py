@@ -39,7 +39,7 @@ def list_configs(_u: CurrentUser, db: DBSession) -> list[LLMConfig]:
 
 
 @router.post("", response_model=LLMConfigOut, status_code=201,
-             dependencies=[Depends(require_role("teacher", "admin"))])
+             dependencies=[Depends(require_role("admin"))])
 def create_cfg(payload: LLMConfigIn, db: DBSession) -> LLMConfig:
     if payload.is_default:
         db.execute(update(LLMConfig).values(is_default=False))
@@ -51,7 +51,7 @@ def create_cfg(payload: LLMConfigIn, db: DBSession) -> LLMConfig:
 
 
 @router.put("/{cfg_id}", response_model=LLMConfigOut,
-            dependencies=[Depends(require_role("teacher", "admin"))])
+            dependencies=[Depends(require_role("admin"))])
 def update_cfg(cfg_id: int, payload: LLMConfigIn, db: DBSession) -> LLMConfig:
     cfg = db.get(LLMConfig, cfg_id)
     if not cfg:
@@ -65,10 +65,17 @@ def update_cfg(cfg_id: int, payload: LLMConfigIn, db: DBSession) -> LLMConfig:
     return cfg
 
 
-@router.delete("/{cfg_id}", dependencies=[Depends(require_role("teacher", "admin"))])
+@router.delete("/{cfg_id}", dependencies=[Depends(require_role("admin"))])
 def delete_cfg(cfg_id: int, db: DBSession) -> dict:
     cfg = db.get(LLMConfig, cfg_id)
-    if cfg:
-        db.delete(cfg)
-        db.commit()
+    if not cfg:
+        raise HTTPException(404, "配置不存在")
+    was_default = cfg.is_default
+    db.delete(cfg)
+    db.commit()
+    if was_default:
+        next_cfg = db.scalar(select(LLMConfig).order_by(LLMConfig.id).limit(1))
+        if next_cfg:
+            next_cfg.is_default = True
+            db.commit()
     return {"ok": True}
