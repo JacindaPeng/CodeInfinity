@@ -2,6 +2,23 @@
 chcp 65001 >nul
 cd /d %~dp0
 call venv\Scripts\activate
-echo 启动后端开发服务（仅监听 app/ 与 scripts/ 变更，避免频繁重启）
-echo 若登录超时，请先停止其他 uvicorn 进程，再重新运行本脚本
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir app --reload-dir scripts --reload-exclude "**/__pycache__/**" --reload-delay 1.0
+
+echo Starting backend dev server...
+echo Stop: Ctrl+C once; if still stuck after 3s, press Ctrl+C again.
+echo.
+
+REM 释放 8000 端口上残留的 uvicorn，避免 SQLite database is locked
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING"') do (
+    echo Stopping leftover process on :8000 PID=%%a
+    taskkill /F /PID %%a >nul 2>&1
+)
+timeout /t 1 /nobreak >nul
+
+python -m scripts.run_migrations
+if errorlevel 1 (
+    echo Migration failed. See log above.
+    pause
+    exit /b 1
+)
+
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir app --reload-delay 1.0 --timeout-graceful-shutdown 3

@@ -4,16 +4,16 @@ import { useRouter } from 'vue-router'
 import {
   ChatDotRound,
   Reading,
-  Guide,
   User,
   UserFilled,
-  FolderOpened,
   Document,
-  Tickets,
-  DataAnalysis,
   List,
   Setting,
   Promotion,
+  DataAnalysis,
+  Cpu,
+  Bell,
+  TrendCharts,
 } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
 
@@ -51,27 +51,29 @@ const learnFeatures = computed<FeatureCard[]>(() => {
       color: '#409eff',
     },
     {
-      title: '课程问答',
-      desc: '基于 RAG 检索 PPT/PDF/视频字幕，按班级推荐学习资源',
-      path: '/course-qa',
+      title: '课程智能体',
+      desc: '选择 C/Java/Python 等课程智能体，进入专属问答与章节学习',
+      path: '/agents',
       icon: Reading,
       color: '#67c23a',
     },
-    {
-      title: '章节学习路线',
-      desc: '按章节学习、参加考核，查看完成进度',
-      path: '/chapters',
-      icon: Guide,
-      color: '#e6a23c',
-    },
     ...(isStudent.value
-      ? [{
-          title: '我的班级',
-          desc: '查看所属班级与同学信息',
-          path: '/my-class',
-          icon: User,
-          color: '#909399',
-        }]
+      ? [
+          {
+            title: '我的班级',
+            desc: '查看已加入的班级，进入各课程智能体',
+            path: '/my-class',
+            icon: User,
+            color: '#909399',
+          },
+          {
+            title: '知识推送',
+            desc: '根据薄弱点从白名单博客推荐延伸阅读',
+            path: '/knowledge-push',
+            icon: Bell,
+            color: '#e6a23c',
+          },
+        ]
       : []),
   ]
 })
@@ -80,10 +82,7 @@ const teachFeatures = computed<FeatureCard[]>(() => {
   if (!isTeacher.value) return []
   return [
     { title: '班级管理', desc: '创建班级、管理学生与任课教师', path: '/teacher/classes', icon: UserFilled, color: '#409eff' },
-    { title: '资料管理', desc: '上传 PPT/PDF/视频，按班级索引知识库', path: '/teacher/materials', icon: FolderOpened, color: '#67c23a' },
-    { title: '考核配置', desc: '按班级配置章节考核与知识点', path: '/teacher/exam-config', icon: Document, color: '#e6a23c' },
-    { title: '题库管理', desc: '维护各班级章节题库，支持批量出题', path: '/teacher/question-bank', icon: Tickets, color: '#f56c6c' },
-    { title: '考核记录', desc: '查看学生答卷、成绩与详细报告', path: '/teacher/exam-records', icon: DataAnalysis, color: '#9c27b0' },
+    { title: '课程智能体', desc: '选择课程后管理资料、题库与考核', path: '/agents', icon: Reading, color: '#67c23a' },
     { title: '调用日志', desc: '查看课程问答与大模型调用记录', path: '/logs', icon: List, color: '#607d8b' },
   ]
 })
@@ -92,28 +91,44 @@ const adminFeatures = computed<FeatureCard[]>(() => {
   if (!isAdmin.value) return []
   return [
     { title: '用户管理', desc: '管理系统用户、重置密码与角色', path: '/admin/users', icon: UserFilled, color: '#409eff' },
+    { title: '智能体管理', desc: '新增、编辑、删除课程智能体及上线状态', path: '/admin/agents', icon: Cpu, color: '#00bcd4' },
     { title: '大模型配置', desc: '配置 DeepSeek 等 LLM 提供商与默认模型', path: '/llm-config', icon: Setting, color: '#67c23a' },
     { title: '全站考核记录', desc: '查看所有班级学生的考核情况', path: '/admin/exam-records', icon: DataAnalysis, color: '#e6a23c' },
+    { title: '知识推送记录', desc: '查看全站学生推送、阅读状态与 RSS 源', path: '/admin/knowledge-push', icon: Bell, color: '#f56c6c' },
+    { title: 'AI反馈监控', desc: '查看学生/教师对 AI 判卷的反馈与介入处理情况', path: '/admin/ai-feedback', icon: TrendCharts, color: '#9c27b0' },
     { title: '全站调用日志', desc: '审计全站 API 与对话调用', path: '/admin/logs', icon: List, color: '#909399' },
   ]
 })
 
-const highlightFeatures = computed<FeatureCard[]>(() => [
-  {
-    title: '学习资源推荐',
-    desc: '在课程问答中根据问题自动推荐 PPT、PDF、视频（含页码与时间戳）',
-    path: '/course-qa',
-    icon: Promotion,
-    color: '#00bcd4',
-  },
-  {
-    title: '章节考核',
-    desc: '题库 + LLM 动态组卷，自动评分并生成学习报告',
-    path: '/chapters',
-    icon: Document,
-    color: '#ff9800',
-  },
-])
+const highlightFeatures = computed<FeatureCard[]>(() => {
+  const items: FeatureCard[] = [
+    {
+      title: '多课程智能体',
+      desc: 'C 语言、Java、Python 等课程独立知识库，选课后进入专属问答与章节考核',
+      path: '/agents',
+      icon: Promotion,
+      color: '#00bcd4',
+    },
+  ]
+  if (isTeacher.value) {
+    items.push({
+      title: '班级隔离',
+      desc: '资料、题库、考核按班级隔离，教师可为不同班级配置独立教学内容',
+      path: '/teacher/classes',
+      icon: Document,
+      color: '#ff9800',
+    })
+  } else if (isStudent.value) {
+    items.push({
+      title: '我的班级',
+      desc: '加入班级后使用本班资料与考核配置',
+      path: '/my-class',
+      icon: User,
+      color: '#ff9800',
+    })
+  }
+  return items
+})
 
 function go(path: string) {
   router.push(path)
@@ -125,7 +140,7 @@ function go(path: string) {
     <el-card shadow="never" class="welcome-card">
       <div class="welcome-inner">
         <div>
-          <h2 class="welcome-title">欢迎使用 C语言程序设计课程智能体</h2>
+          <h2 class="welcome-title">欢迎使用 CodeInfinity</h2>
           <p class="welcome-sub">
             你好，{{ auth.user?.display_name }}
             <el-tag size="small" type="info" style="margin-left: 8px">{{ roleLabel }}</el-tag>

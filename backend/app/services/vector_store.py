@@ -66,12 +66,23 @@ def delete_by_material(material_id: int) -> None:
 
 def query(question: str, n_results: int = 5, where: dict | None = None) -> list[dict]:
     """检索相关 chunk。返回 [{document, metadata, distance}]。"""
-    res = get_collection().query(query_texts=[question], n_results=n_results, where=where)
-    docs = res["documents"][0] if res["documents"] else []
-    metas = res["metadatas"][0] if res["metadatas"] else []
-    dists = res["distances"][0] if res["distances"] else []
-    return [{"document": d, "metadata": m, "distance": dist}
-            for d, m, dist in zip(docs, metas, dists)]
+    for n in (n_results, max(1, n_results // 2), 1):
+        try:
+            res = get_collection().query(query_texts=[question], n_results=n, where=where)
+            docs = res["documents"][0] if res["documents"] else []
+            metas = res["metadatas"][0] if res["metadatas"] else []
+            dists = res["distances"][0] if res["distances"] else []
+            return [{"document": d, "metadata": m, "distance": dist}
+                    for d, m, dist in zip(docs, metas, dists)]
+        except Exception:
+            continue
+    return []
+
+
+def shutdown_client() -> None:
+    """释放 Chroma 持久化客户端，避免退出时后台线程拖住进程。"""
+    global _client
+    _client = None
 
 
 def count(class_ids: list[int] | None = None) -> int:

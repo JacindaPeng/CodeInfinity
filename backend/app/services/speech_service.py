@@ -58,13 +58,17 @@ def _to_wav(src: str) -> str:
 def transcribe_audio_file(path: str) -> str:
     """将音频文件转为中文文本。"""
     _prepare_runtime()
-    from .video_service import _get_whisper_model
+    from .video_service import normalize_subtitle, transcribe
 
     wav_path = _to_wav(path)
     try:
-        model = _get_whisper_model()
-        result = model.transcribe(wav_path, language="zh", verbose=False)
-        text = (result.get("text") or "").strip()
+        segs = transcribe(wav_path)
+        text = normalize_subtitle("".join(s["text"] for s in segs)).strip()
+        if not text:
+            from .video_service import _get_whisper_model
+            model = _get_whisper_model()
+            result = model.transcribe(wav_path, language="zh", verbose=False, temperature=0.0)
+            text = normalize_subtitle((result.get("text") or "").strip())
         if not text:
             raise ValueError("未识别到有效语音内容")
         return text
@@ -74,7 +78,6 @@ def transcribe_audio_file(path: str) -> str:
                 os.unlink(wav_path)
             except OSError:
                 pass
-
 
 async def transcribe_upload(raw: bytes, filename: str) -> str:
     suffix = Path(filename).suffix.lower() or ".webm"

@@ -1,26 +1,42 @@
+name: codeinfinity
+
 services:
   backend:
     build: ./backend
     container_name: ccourse-backend
     environment:
-      - LLM_DEFAULT_PROVIDER=deepseek
+      - LLM_DEFAULT_PROVIDER=${LLM_DEFAULT_PROVIDER:-deepseek}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - JWT_SECRET=${JWT_SECRET:-change-me-in-production-please-use-a-long-random-string}
+      # 短信：默认开发模式固定码 123456。真发需在根目录 .env 设 SMS_DEV_MODE=0 并填阿里云 PNVS
+      - SMS_DEV_MODE=${SMS_DEV_MODE:-1}
+      - SMS_DEV_CODE=${SMS_DEV_CODE:-123456}
+      - ALIYUN_SMS_ACCESS_KEY_ID=${ALIYUN_SMS_ACCESS_KEY_ID:-}
+      - ALIYUN_SMS_ACCESS_KEY_SECRET=${ALIYUN_SMS_ACCESS_KEY_SECRET:-}
+      - ALIYUN_PNVS_SIGN_NAME=${ALIYUN_PNVS_SIGN_NAME:-}
+      - ALIYUN_PNVS_TEMPLATE_CODE=${ALIYUN_PNVS_TEMPLATE_CODE:-}
       - SQLITE_PATH=/data/course.db
       - CHROMA_PATH=/data/chroma
       - UPLOAD_DIR=/data/uploads
-      - CORS_ORIGINS=http://localhost,http://localhost:5173
+      - CORS_ORIGINS=http://localhost,http://127.0.0.1,http://localhost:5173
     volumes:
       - ./data:/data
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     restart: unless-stopped
 
   frontend:
     build: ./frontend
     container_name: ccourse-frontend
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
       - "80:80"
     restart: unless-stopped

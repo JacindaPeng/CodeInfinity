@@ -18,6 +18,13 @@ export const useAuthStore = defineStore('auth', () => {
     return data.user
   }
 
+  async function loginByPhone(phone: string, code: string) {
+    const data = await authApi.loginByPhone({ phone, code })
+    setToken(data.access_token)
+    user.value = data.user
+    return data.user
+  }
+
   async function fetchMe() {
     if (!token.value) return null
     try {
@@ -25,6 +32,7 @@ export const useAuthStore = defineStore('auth', () => {
       return user.value
     } catch {
       token.value = ''
+      user.value = null
       localStorage.removeItem('token')
       return null
     }
@@ -36,5 +44,5 @@ export const useAuthStore = defineStore('auth', () => {
     localStorage.removeItem('token')
   }
 
-  return { token, user, login, fetchMe, logout, setToken }
+  return { token, user, login, loginByPhone, fetchMe, logout, setToken }
 })

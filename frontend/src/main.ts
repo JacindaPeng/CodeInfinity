@@ -7,10 +7,12 @@ import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 
 import App from './App.vue'
 import router from './router'
+import { useAuthStore } from './stores/auth'
 import './styles/main.css'
 
 const app = createApp(App)
-app.use(createPinia())
+const pinia = createPinia()
+app.use(pinia)
 app.use(router)
 app.use(ElementPlus, { locale: zhCn })
 
@@ -18,4 +20,13 @@ for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
   app.component(key, component as any)
 }
 
-app.mount('#app')
+async function bootstrap() {
+  const auth = useAuthStore()
+  if (auth.token && !auth.user) {
+    await auth.fetchMe()
+  }
+  await router.isReady()
+  app.mount('#app')
+}
+
+bootstrap()

@@ -1,11 +1,14 @@
 <script setup lang="ts">
 import { ref, nextTick, onMounted, onUnmounted, watch, computed } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Paperclip, Close, Microphone } from '@element-plus/icons-vue'
 import http, { sseStream } from '@/api'
 import MarkdownView from '@/components/MarkdownView.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useCourseAgentStore } from '@/stores/courseAgent'
+import { useAgentBoundClasses } from '@/composables/useAgentBoundClasses'
+import { handleMaterialClick, fmtVideoTime, type MaterialRec } from '@/utils/materialAccess'
 
 interface Chapter { id: number; title: string }
 interface Recommend {
@@ -41,7 +44,12 @@ interface LlmCfg {
 }
 interface Prov { provider: string; label: string }
 interface ClassItem { id: number; name: string }
-interface MyClassInfo { class_id: number | null; class_name?: string; name?: string }
+interface Enrollment {
+  class_id: number
+  class_name: string
+  course_id: number
+  course_name: string
+}
 interface QaHistoryItem {
   id: number
   question: string
@@ -59,33 +67,50 @@ const chapters = ref<Chapter[]>([])
 const chapterId = ref<number | undefined>(undefined)
 const classes = ref<ClassItem[]>([])
 const selectedClassId = ref<number | undefined>(undefined)
-const myClass = ref<MyClassInfo | null>(null)
+const myEnrollments = ref<Enrollment[]>([])
 const userStore = useAuthStore()
 const agentStore = useCourseAgentStore()
+const { loadScopedClasses, pickClassId, isSharedPreview } = useAgentBoundClasses()
+const router = useRouter()
+const needsAgentGuide = computed(() => !agentStore.current)
+const agentPlanned = computed(() => agentStore.current && !agentStore.isActive())
 const isStudent = computed(() => userStore.user?.role === 'student')
 const isTeacher = computed(() => userStore.user?.role === 'teacher')
 const classLabel = computed(() => {
-  if (isStudent.value) return myClass.value?.class_name || myClass.value?.name || ''
+  if (isStudent.value) {
+    const cid = activeClassId.value
+    const e = myEnrollments.value.find(x => x.class_id === cid)
+    return e ? `${e.class_name}（${e.course_name}）` : ''
+  }
   const c = classes.value.find(x => x.id === selectedClassId.value)
   return c?.name || ''
 })
 const activeClassId = computed(() => {
-  if (isStudent.value) return myClass.value?.class_id ?? undefined
+  if (isStudent.value) {
+    const courseId = agentStore.current?.course_id
+    if (!courseId) return undefined
+    const e = myEnrollments.value.find(x => x.course_id === courseId)
+    return e?.class_id
+  }
   return selectedClassId.value
 })
+const studentNeedsEnrollment = computed(() =>
+  isStudent.value && !!agentStore.current?.course_id && !activeClassId.value
+)
 const configs = ref<LlmCfg[]>([])
 const providers = ref<Prov[]>([])
 const selectedConfigId = ref<number | undefined>(undefined)
 const messages = ref<Msg[]>([
-  { role: 'assistant', content: '你好，我是 C语言课程智能体。可以问任何 C 语言相关问题，我会从课程资料中检索并回答，同时推荐相关学习资源。也可上传文件或语音输入提问。' },
+  { role: 'assistant', content: '你好，我是课程智能体。可以问任何课程相关问题，我会从课程资料中检索并回答，同时推荐相关学习资源。也可上传文件或语音输入提问。' },
 ])
 const input = ref('')
 const loading = ref(false)
 const fileParsing = ref(false)
 const boxRef = ref<HTMLElement | null>(null)
 const videoDialog = ref(false)
-const videoUrl = ref('')
+const videoBlobUrl = ref('')
 const videoStart = ref(0)
+const materialLoading = ref<string | null>(null)
 const attachments = ref<ChatAttachment[]>([])
 
 const qaHistory = ref<QaHistoryItem[]>([])
@@ -358,7 +383,9 @@ async function onFileSelect(file: { raw: File }) {
 async function loadQaHistory() {
   historyLoading.value = true
   try {
-    const { data } = await http.get('/agents/course/history', { params: { page: 1, size: 20 } })
+    const params: Record<string, number> = { page: 1, size: 20 }
+    if (agentStore.current?.id) params.agent_id = agentStore.current.id
+    const { data } = await http.get('/agents/course/history', { params })
     qaHistory.value = data.items
   } finally {
     historyLoading.value = false
@@ -504,6 +531,7 @@ function fmtHistoryTime(iso: string | null) {
 async function loadChapters() {
   const params: Record<string, number> = {}
   if (agentStore.current?.course_id) params.course_id = agentStore.current.course_id
+  if (agentStore.current?.id) params.agent_id = agentStore.current.id
   const { data } = await http.get<Chapter[]>('/chapters', { params })
   chapters.value = data
 }
@@ -511,22 +539,17 @@ async function loadChapters() {
 async function loadClasses() {
   if (isStudent.value) {
     try {
-      const { data } = await http.get<MyClassInfo>('/classes/my')
-      myClass.value = data
+      const { data } = await http.get<Enrollment[]>('/classes/my')
+      myEnrollments.value = data
     } catch {
-      myClass.value = null
+      myEnrollments.value = []
     }
     return
   }
   if (isTeacher.value) {
-    const { data } = await http.get<ClassItem[]>('/classes/mine')
+    const data = await loadScopedClasses()
     classes.value = data
-    const saved = Number(localStorage.getItem('qa_class_id') || 0)
-    if (saved && data.some(c => c.id === saved)) {
-      selectedClassId.value = saved
-    } else if (data.length) {
-      selectedClassId.value = data[0].id
-    }
+    selectedClassId.value = pickClassId(data, selectedClassId.value, 'qa_class_id')
   }
 }
 
@@ -583,6 +606,14 @@ async function send() {
     ElMessage.warning(isTeacher.value ? '请先选择班级' : '未加入班级，无法检索课程资料')
     return
   }
+  if (!agentStore.current?.id) {
+    ElMessage.warning('请先从「课程智能体」选择一门课程')
+    return
+  }
+  if (!agentStore.isActive()) {
+    ElMessage.warning('当前课程智能体尚未上线，请从课程智能体列表选择已上线课程')
+    return
+  }
   input.value = ''
   attachments.value = []
   loading.value = true
@@ -607,6 +638,7 @@ async function send() {
         question: text,
         chapter_id: chapterId.value,
         class_id: activeClassId.value,
+        agent_id: agentStore.current?.id,
         history,
         config_id: selectedConfigId.value,
         attachments: files.map(f => ({
@@ -649,17 +681,44 @@ function onEnter(e: KeyboardEvent) {
   send()
 }
 
-function playVideo(rec: Recommend) {
-  videoUrl.value = rec.file_url
-  videoStart.value = rec.video_start_sec || 0
+function showVideo(blobUrl: string, startSec: number) {
+  if (videoBlobUrl.value) URL.revokeObjectURL(videoBlobUrl.value)
+  videoBlobUrl.value = blobUrl
+  videoStart.value = startSec
   videoDialog.value = true
   nextTick(() => {
     const v = document.querySelector('video#qa-video') as HTMLVideoElement | null
     if (v) {
-      v.currentTime = videoStart.value
+      v.currentTime = startSec
       v.play().catch(() => {})
     }
   })
+}
+
+function onVideoDialogClose() {
+  if (videoBlobUrl.value) {
+    URL.revokeObjectURL(videoBlobUrl.value)
+    videoBlobUrl.value = ''
+  }
+}
+
+async function openRecommend(rec: Recommend | MaterialRec) {
+  const key = `${rec.material_id || rec.file_url}`
+  if (materialLoading.value) return
+  materialLoading.value = key
+  try {
+    await handleMaterialClick(rec, showVideo)
+  } finally {
+    materialLoading.value = null
+  }
+}
+
+function recActionLabel(rec: Recommend | MaterialRec) {
+  if (rec.type === 'video') {
+    const sec = rec.video_start_sec || 0
+    return sec ? `观看 ${fmtTime(sec)}` : '观看'
+  }
+  return '下载'
 }
 
 const typeTag = (t: string) => {
@@ -668,15 +727,15 @@ const typeTag = (t: string) => {
 }
 
 function fmtTime(s: number) {
-  const m = Math.floor(s / 60); const r = s % 60
-  return `${m}:${r.toString().padStart(2, '0')}`
-}
-
-function openUrl(url: string) {
-  window.open(url, '_blank')
+  return fmtVideoTime(s)
 }
 
 onMounted(async () => {
+  await agentStore.restoreAgent()
+  if (agentStore.current?.name) {
+    messages.value[0].content =
+      `你好，我是${agentStore.current.name}。可以问任何课程相关问题，我会从课程资料中检索并回答，同时推荐相关学习资源。也可上传文件或语音输入提问。`
+  }
   await loadVoiceStatus()
   await loadClasses()
   await Promise.all([loadChapters(), loadConfigs(), loadQaHistory()])
@@ -694,12 +753,7 @@ onUnmounted(() => {
     <el-col :span="18">
       <el-card shadow="never" class="chat-card">
         <template #header>
-          <div class="qa-header">
-            <span>课程问答（RAG 流式）</span>
-            <el-tag v-if="agentStore.current" size="small" type="primary" style="margin-left: 8px">
-              {{ agentStore.current.name }}
-            </el-tag>
-            <div class="qa-header-actions">
+          <div class="qa-header-actions">
               <el-select
                 v-if="isTeacher"
                 v-model="selectedClassId"
@@ -728,9 +782,50 @@ onUnmounted(() => {
               <el-select v-model="chapterId" placeholder="限定章节（可选）" clearable style="width: 200px">
                 <el-option v-for="c in chapters" :key="c.id" :label="c.title" :value="c.id" />
               </el-select>
-            </div>
           </div>
         </template>
+
+        <el-alert
+          v-if="isSharedPreview"
+          type="info"
+          :closable="false"
+          show-icon
+          title="正在体验共享智能体问答"
+          description="检索范围来自源教师共享资料。若回答空洞，请确认左侧班级筛选为源侧班级。"
+          style="margin-bottom: 8px"
+        />
+
+        <el-alert
+          v-if="needsAgentGuide"
+          type="warning"
+          :closable="false"
+          title="尚未选择课程"
+          style="margin-bottom: 8px"
+        >
+          <template #default>
+            请先从
+            <el-link type="primary" @click="router.push('/agents')">课程智能体</el-link>
+            选择一门课程，或从课程首页进入本页。
+          </template>
+        </el-alert>
+
+        <el-alert
+          v-if="agentPlanned"
+          type="info"
+          :closable="false"
+          :title="`${agentStore.current?.name} 尚未上线`"
+          description="该课程正在筹备中，暂无法使用课程问答。请选择已上线的 C 语言课程智能体。"
+          style="margin-bottom: 8px"
+        />
+
+        <el-alert
+          v-if="studentNeedsEnrollment"
+          type="warning"
+          :closable="false"
+          title="尚未加入该课程班级"
+          description="请先在「我的班级」使用邀请码加入对应课程班级后，再使用课程问答。"
+          style="margin-bottom: 8px"
+        />
 
         <el-alert
           v-if="isTeacher && !classes.length"
@@ -764,19 +859,25 @@ onUnmounted(() => {
               </div>
               <div v-if="m.recommends && m.recommends.length" class="recommends">
                 <div class="rec-title">建议学习：</div>
-                <div v-for="r in m.recommends" :key="r.material_id + '-' + (r.page || '')" class="rec-item">
+                <div
+                  v-for="r in m.recommends"
+                  :key="r.material_id + '-' + (r.page || '') + '-' + (r.video_start_sec ?? '')"
+                  class="rec-item"
+                >
                   <el-tag :type="typeTag(r.type) as any" size="small">{{ r.type }}</el-tag>
                   <span class="rec-name">{{ r.title }}</span>
                   <span class="rec-chapter">{{ r.chapter_title }}</span>
                   <span v-if="r.pages?.length" class="rec-page">PDF第{{ r.pages.join('、') }}页</span>
                   <span v-else-if="r.page" class="rec-page">PDF第{{ r.page }}页</span>
+                  <span v-if="r.type === 'video' && r.video_start_sec != null" class="rec-page">
+                    视频 {{ fmtTime(r.video_start_sec) }}
+                  </span>
                   <span v-if="r.keywords?.length" class="rec-kw">{{ r.keywords.join('、') }}</span>
-                  <el-button v-if="r.type === 'video'" text type="primary" size="small"
-                    @click="playVideo(r)">
-                    跳转视频 {{ fmtTime(r.video_start_sec || 0) }}
-                  </el-button>
-                  <el-button v-else text type="primary" size="small"
-                    @click="openUrl(r.file_url)">查看</el-button>
+                  <el-button
+                    text type="primary" size="small"
+                    :loading="materialLoading === `${r.material_id || r.file_url}`"
+                    @click="openRecommend(r)"
+                  >{{ recActionLabel(r) }}</el-button>
                 </div>
               </div>
             </div>
@@ -958,19 +1059,13 @@ onUnmounted(() => {
     </template>
   </el-drawer>
 
-  <el-dialog v-model="videoDialog" title="视频预览" width="720px" @close="videoUrl = ''">
-    <video v-if="videoUrl" id="qa-video" :src="videoUrl" controls style="width: 100%"></video>
+  <el-dialog v-model="videoDialog" title="视频预览" width="720px" @close="onVideoDialogClose">
+    <video v-if="videoBlobUrl" id="qa-video" :src="videoBlobUrl" controls style="width: 100%"></video>
   </el-dialog>
 </template>
 
 <style scoped>
 .chat-card { height: calc(100vh - 140px); display: flex; flex-direction: column; }
-.qa-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-}
 .qa-header-actions {
   display: flex;
   align-items: center;

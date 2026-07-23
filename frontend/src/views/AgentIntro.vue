@@ -2,24 +2,42 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import http from '@/api'
-import { useCourseAgentStore, type CourseAgentInfo } from '@/stores/courseAgent'
+import { useAuthStore } from '@/stores/auth'
+import { useCourseAgentStore, isAgentSharedPreview, type CourseAgentInfo } from '@/stores/courseAgent'
 
 const route = useRoute()
 const router = useRouter()
 const agentStore = useCourseAgentStore()
+const auth = useAuthStore()
 const agent = ref<CourseAgentInfo | null>(null)
 
 const isActive = computed(() => agent.value?.status === 'active')
+const isTeacher = computed(() => auth.user?.role === 'teacher')
+const canEnterHome = computed(() => isActive.value || isTeacher.value)
+const fromShared = computed(() => route.query.from === 'shared')
+const isSharedPreview = computed(
+  () => fromShared.value && isTeacher.value && isAgentSharedPreview(agent.value),
+)
 
-async function load() {
-  const { data } = await http.get<CourseAgentInfo>(`/agents/${route.params.id}`)
-  agent.value = data
+function goBack() {
+  if (fromShared.value) {
+    router.push({ path: '/agents', query: { tab: 'shared' } })
+    return
+  }
+  router.push('/agents')
 }
 
 function enterHome() {
   if (!agent.value) return
   agentStore.setAgent(agent.value)
-  router.push(`/agents/${agent.value.id}/home`)
+  const q = fromShared.value ? { from: 'shared' } : undefined
+  router.push({ path: `/agents/${agent.value.id}/home`, query: q })
+}
+
+async function load() {
+  const { data } = await http.get<CourseAgentInfo>(`/agents/${route.params.id}`)
+  agent.value = data
+  agentStore.setAgent(data)
 }
 
 onMounted(load)
@@ -30,15 +48,26 @@ onMounted(load)
     <template #header>
       <div class="header-row">
         <span>{{ agent.name }}</span>
-        <el-button text @click="router.push('/agents')">返回列表</el-button>
+        <el-button text @click="goBack">{{ fromShared ? '返回共享广场' : '返回列表' }}</el-button>
       </div>
     </template>
 
+    <el-alert
+      v-if="isSharedPreview"
+      type="info"
+      :closable="false"
+      title="共享智能体预览"
+      description="您正在查看共享广场中的智能体。可进入课程首页体验问答与章节学习；若要在本班正式使用，请返回共享广场点击「加入我的管理」。"
+      style="margin-bottom: 12px"
+    />
+
     <el-tag v-if="isActive" type="success" style="margin-bottom: 12px">已上线</el-tag>
     <el-tag v-else type="info" style="margin-bottom: 12px">筹备中</el-tag>
+    <el-tag v-if="agent.is_shared" type="warning" style="margin-left: 8px; margin-bottom: 12px">共享</el-tag>
 
     <h3>智能体介绍</h3>
     <p class="intro-text">{{ agent.intro }}</p>
+    <p v-if="agent.owner_name" class="meta-line muted">共享教师：{{ agent.owner_name }}</p>
 
     <el-divider />
 
@@ -59,10 +88,10 @@ onMounted(load)
     </ul>
 
     <div class="actions">
-      <el-button type="primary" :disabled="!isActive" @click="enterHome">
-        {{ isActive ? '进入课程首页' : '筹备中，暂不可用' }}
+      <el-button type="primary" :disabled="!canEnterHome" @click="enterHome">
+        {{ isSharedPreview ? '体验功能' : (isActive ? '进入课程首页' : (isTeacher ? '进入课程首页（筹备中）' : '筹备中，暂不可用')) }}
       </el-button>
-      <el-button v-if="!isActive" @click="router.push('/agents')">浏览其他智能体</el-button>
+      <el-button v-if="!canEnterHome" @click="goBack">浏览其他智能体</el-button>
     </div>
   </el-card>
 </template>

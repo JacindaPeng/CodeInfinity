@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import AsyncGenerator
 
 import httpx
@@ -12,6 +14,16 @@ from sqlalchemy import select
 from ..config import Settings, settings
 from ..database import SessionLocal
 from ..models import LLMConfig
+
+# 代理/长回答场景：读超时放宽；连接掐断时自动重试
+_LLM_TIMEOUT = httpx.Timeout(connect=20.0, read=180.0, write=60.0, pool=20.0)
+_RETRYABLE = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpx.ProxyError,
+)
 
 
 class LLMProvider:
@@ -41,22 +53,33 @@ class LLMProvider:
 class OpenAICompatibleProvider(LLMProvider):
     """OpenAI 兼容协议实现（DeepSeek/OpenAI/Qwen 等通用）。"""
 
-    async def stream_chat(self, messages: list[dict]) -> AsyncGenerator[str, None]:
-        url = f"{self.base_url}/chat/completions"
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-            "temperature": 0.7,
-        }
-        headers = {
+    def _headers(self) -> dict[str, str]:
+        return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        timeout = httpx.Timeout(60.0, connect=10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", url, json=payload, headers=headers) as resp:
-                resp.raise_for_status()
+
+    def _payload(self, messages: list[dict], *, stream: bool) -> dict:
+        return {
+            "model": self.model,
+            "messages": messages,
+            "stream": stream,
+            "temperature": 0.7,
+        }
+
+    async def _stream_once(self, messages: list[dict]) -> AsyncGenerator[str, None]:
+        url = f"{self.base_url}/chat/completions"
+        async with httpx.AsyncClient(timeout=_LLM_TIMEOUT) as client:
+            async with client.stream(
+                "POST", url, json=self._payload(messages, stream=True), headers=self._headers(),
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = (await resp.aread()).decode("utf-8", errors="ignore")[:300]
+                    raise httpx.HTTPStatusError(
+                        f"LLM HTTP {resp.status_code}: {body}",
+                        request=resp.request,
+                        response=resp,
+                    )
                 async for line in resp.aiter_lines():
                     if not line or not line.startswith("data:"):
                         continue
@@ -64,12 +87,56 @@ class OpenAICompatibleProvider(LLMProvider):
                     if data == "[DONE]":
                         break
                     try:
-                        obj = __import__("json").loads(data)
+                        obj = json.loads(data)
                         delta = obj["choices"][0]["delta"].get("content", "")
                         if delta:
                             yield delta
                     except Exception:
                         continue
+
+    async def _chat_once(self, messages: list[dict]) -> str:
+        """非流式兜底，避免流被代理中途掐断后整问失败。"""
+        url = f"{self.base_url}/chat/completions"
+        async with httpx.AsyncClient(timeout=_LLM_TIMEOUT) as client:
+            resp = await client.post(
+                url, json=self._payload(messages, stream=False), headers=self._headers(),
+            )
+            resp.raise_for_status()
+            obj = resp.json()
+            return (((obj.get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
+
+    async def stream_chat(self, messages: list[dict]) -> AsyncGenerator[str, None]:
+        last_err: Exception | None = None
+        for attempt in range(3):
+            got_any = False
+            try:
+                async for token in self._stream_once(messages):
+                    got_any = True
+                    yield token
+                return
+            except _RETRYABLE as e:
+                last_err = e
+                # 已输出部分内容则结束，避免重复段落
+                if got_any:
+                    return
+                await asyncio.sleep(0.5 * (attempt + 1))
+            except httpx.HTTPStatusError as e:
+                last_err = e
+                break
+
+        # 流式三次仍失败：改一次非流式
+        try:
+            text = await self._chat_once(messages)
+            if text:
+                yield text
+                return
+        except Exception as e:
+            last_err = e
+
+        hint = str(last_err) if last_err else "未知错误"
+        if "incomplete chunked" in hint or "peer closed" in hint.lower():
+            hint = "上游连接中断（代理或不稳定网络），已重试仍失败，请稍后再试或换一个模型"
+        raise RuntimeError(f"LLM 调用失败: {hint}") from last_err
 
 
 # ---- 提供商注册表 ----

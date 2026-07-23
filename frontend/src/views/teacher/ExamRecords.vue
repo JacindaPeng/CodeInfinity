@@ -2,8 +2,11 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import http from '@/api'
+import { useCourseAgentStore } from '@/stores/courseAgent'
+import { useAgentCourseScope } from '@/composables/useAgentCourseScope'
+import { useAgentBoundClasses } from '@/composables/useAgentBoundClasses'
 
-interface Record {
+interface ExamRecordRow {
   id: number
   user_id: number
   username: string
@@ -16,50 +19,57 @@ interface Record {
   started_at: string | null
   submitted_at: string | null
 }
-interface Student { id: number; username: string; display_name: string }
 interface Chapter { id: number; title: string }
 interface ClassItem { id: number; name: string }
+interface CourseItem { id: number; name: string }
 
+const agentStore = useCourseAgentStore()
+const { lockedCourse, applyLockedCourse, chapterListParams } = useAgentCourseScope()
+const { loadScopedClasses, pickClassId } = useAgentBoundClasses()
 const route = useRoute()
 const router = useRouter()
 const isAdminMode = computed(() => route.path.includes('/admin/'))
 
-const list = ref<Record[]>([])
+const list = ref<ExamRecordRow[]>([])
 const total = ref(0)
 const page = ref(1)
 const size = ref(20)
 const loading = ref(false)
 
 const chapters = ref<Chapter[]>([])
+const courses = ref<CourseItem[]>([])
+const selectedCourseId = ref<number | undefined>(undefined)
 const classes = ref<ClassItem[]>([])
-const students = ref<Student[]>([])
 const filterClass = ref<number | undefined>(undefined)
 const filterChapter = ref<number | undefined>(undefined)
-const filterStudent = ref<number | undefined>(undefined)
 
-async function loadStudents() {
-  const url = isAdminMode.value ? '/admin/exams/students' : '/exams/teacher/students'
-  const { data } = await http.get<Student[]>(url, {
-    params: { class_id: filterClass.value || undefined },
-  })
-  students.value = data
-  if (filterStudent.value && !data.some(s => s.id === filterStudent.value)) {
-    filterStudent.value = undefined
+async function loadFilters() {
+  if (!applyLockedCourse(selectedCourseId, courses)) {
+    const { data: courseData } = await http.get<CourseItem[]>('/courses')
+    courses.value = courseData
+    if (!selectedCourseId.value) {
+      selectedCourseId.value = courseData[0]?.id
+    }
+  }
+  const params = chapterListParams()
+  if (!params.course_id && selectedCourseId.value) params.course_id = selectedCourseId.value
+  const ch = await http.get<Chapter[]>('/chapters', { params })
+  chapters.value = ch.data
+  if (isAdminMode.value) {
+    const cls = await http.get<ClassItem[]>('/admin/classes')
+    classes.value = cls.data
+  } else {
+    classes.value = await loadScopedClasses()
+    filterClass.value = pickClassId(classes.value, filterClass.value)
   }
 }
 
-async function loadFilters() {
-  const ch = await http.get<Chapter[]>('/chapters')
-  chapters.value = ch.data
-  const clsUrl = isAdminMode.value ? '/admin/classes' : '/classes/mine'
-  const cls = await http.get<ClassItem[]>(clsUrl)
-  classes.value = cls.data
-  await loadStudents()
+function onCourseChange() {
+  filterChapter.value = undefined
+  loadFilters().then(() => onFilter())
 }
 
-async function onClassChange() {
-  filterStudent.value = undefined
-  await loadStudents()
+function onClassChange() {
   onFilter()
 }
 
@@ -72,7 +82,7 @@ async function load() {
         page: page.value, size: size.value,
         class_id: filterClass.value || undefined,
         chapter_id: filterChapter.value || undefined,
-        user_id: filterStudent.value || undefined,
+        agent_id: agentStore.current?.id || undefined,
       },
     })
     list.value = data.items
@@ -85,7 +95,7 @@ async function load() {
 function onPage(p: number) { page.value = p; load() }
 function onFilter() { page.value = 1; load() }
 
-function viewReport(row: Record) {
+function viewReport(row: ExamRecordRow) {
   const prefix = isAdminMode.value ? '/admin/exams' : '/teacher/exams'
   router.push(`${prefix}/${row.id}/report`)
 }
@@ -98,6 +108,7 @@ const scoreColor = (s: number | null) => {
 }
 
 onMounted(async () => {
+  await agentStore.restoreAgent()
   await loadFilters()
   await load()
 })
@@ -108,15 +119,21 @@ onMounted(async () => {
     <template #header>
       <div style="display: flex; justify-content: space-between; align-items: center">
         <span>{{ isAdminMode ? '全站考核记录' : '学生考核记录' }}</span>
-        <div>
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
+          <el-select
+            v-if="!lockedCourse"
+            v-model="selectedCourseId"
+            placeholder="选择课程"
+            style="width: 200px; margin-right: 8px"
+            @change="onCourseChange"
+          >
+            <el-option v-for="c in courses" :key="c.id" :label="c.name" :value="c.id" />
+          </el-select>
           <el-select v-model="filterClass" placeholder="按班级筛选" clearable @change="onClassChange" style="width: 180px; margin-right: 8px">
             <el-option v-for="c in classes" :key="c.id" :label="c.name" :value="c.id" />
           </el-select>
-          <el-select v-model="filterChapter" placeholder="按章节筛选" clearable @change="onFilter" style="width: 200px; margin-right: 8px">
+          <el-select v-model="filterChapter" placeholder="按章节筛选" clearable @change="onFilter" style="width: 200px">
             <el-option v-for="c in chapters" :key="c.id" :label="c.title" :value="c.id" />
-          </el-select>
-          <el-select v-model="filterStudent" placeholder="按学生筛选" clearable @change="onFilter" style="width: 160px">
-            <el-option v-for="s in students" :key="s.id" :label="s.display_name || s.username" :value="s.id" />
           </el-select>
         </div>
       </div>

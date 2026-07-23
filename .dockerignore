@@ -1,0 +1,16 @@
+.git/
+.cursor/
+**/venv/
+**/node_modules/
+**/__pycache__/
+data/
+PL_Course/
+chroma/
+uploads/
+chat_attachments/
+*.mp4
+*.pdf
+*.zip
+docs/演示视频/
+backend/.env
+frontend/dist/

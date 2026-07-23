@@ -3,23 +3,60 @@
 路由顺序：具体路径（/start, /history/*, /teacher/*, /config/*, /bank/*, /knowledge-points/*）
 必须定义在 /{exam_id} 通配之前，避免被 {exam_id} 抢占匹配。
 """
+import json
+import time
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
+from sse_starlette.sse import EventSourceResponse
 
-from ..deps import CurrentUser, DBSession, require_role, resolve_teacher_scope, assert_teacher_can_view_student, assert_can_access_question, assert_teacher_upload_class, resolve_resource_class_ids, resolve_config_class_id, get_exam_config
+from ..deps import (
+    CurrentUser,
+    DBSession,
+    require_role,
+    resolve_teacher_scope,
+    assert_teacher_can_view_student,
+    assert_can_access_question,
+    assert_teacher_upload_class,
+    assert_teacher_manages_class,
+    resolve_resource_class_ids,
+    resolve_config_class_id,
+    get_exam_config,
+    get_managed_class_ids,
+    get_class_student_ids,
+    log_call,
+)
 from ..models import (
+    Agent,
     Chapter,
     Exam,
     ExamConfig,
+    ExamIntervention,
     ExamQuestion,
     ExamReport,
     KnowledgePoint,
+    Material,
     QuestionBank,
     TeachingClass,
     User,
 )
-from ..services import exam_service
+from ..services.chapter_sync import (
+    C_LANG_COURSE_ID,
+    requires_agent_scoped_chapters,
+    uses_course_level_preset_chapters,
+    agent_scoped_chapter_condition,
+)
+from ..services.enrollment import get_student_class_for_course
+from ..services import exam_service, exam_feedback_service, kp_suggest_service
+from ..services.agent_access import (
+    apply_agent_content_scope,
+    get_shared_exam_config,
+    is_adopted_snapshot,
+    resolve_agent_for_exam,
+    resolve_bank_class_ids,
+    resolve_resource_class_ids_for_agent,
+)
 
 router = APIRouter(prefix="/exams", tags=["exams"])
 
@@ -29,23 +66,35 @@ router = APIRouter(prefix="/exams", tags=["exams"])
 class StartIn(BaseModel):
     chapter_id: int
     class_id: int | None = None  # 教师考核测试时指定班级
+    agent_id: int | None = None  # 课程智能体（共享资料/题库）
+
+
+class GradingFeedbackIn(BaseModel):
+    verdict: str  # agree / disagree
+    comment: str = ""
 
 
 @router.post("/start")
 def start_exam(payload: StartIn, user: CurrentUser, db: DBSession) -> dict:
     try:
         if user.role == "student":
-            exam_class_id = user.class_id
+            chapter = db.get(Chapter, payload.chapter_id)
+            if not chapter:
+                raise HTTPException(404, "章节不存在")
+            exam_class_id = get_student_class_for_course(db, user, chapter.course_id)
+            if not exam_class_id:
+                raise HTTPException(400, "尚未加入该课程班级，无法开始考核")
             teacher_test = False
         else:
             if not payload.class_id:
                 raise HTTPException(400, "请指定班级")
-            exam_class_id = resolve_config_class_id(db, user, payload.class_id)
+            exam_class_id = resolve_config_class_id(db, user, payload.class_id, agent_id=payload.agent_id)
             teacher_test = True
         exam, warnings = exam_service.generate_paper(
             db, user, payload.chapter_id,
             class_id=exam_class_id,
             teacher_test=teacher_test,
+            agent_id=payload.agent_id,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -57,8 +106,20 @@ def start_exam(payload: StartIn, user: CurrentUser, db: DBSession) -> dict:
 
 
 @router.get("/history/mine")
-def my_history(user: CurrentUser, db: DBSession) -> list[dict]:
-    rows = db.scalars(select(Exam).where(Exam.user_id == user.id).order_by(Exam.id.desc())).all()
+def my_history(
+    user: CurrentUser,
+    db: DBSession,
+    course_id: int | None = Query(default=None),
+) -> list[dict]:
+    base = select(Exam).where(Exam.user_id == user.id)
+    if course_id is not None:
+        chapter_ids = db.scalars(
+            select(Chapter.id).where(Chapter.course_id == course_id)
+        ).all()
+        if not chapter_ids:
+            return []
+        base = base.where(Exam.chapter_id.in_(chapter_ids))
+    rows = db.scalars(base.order_by(Exam.id.desc())).all()
     out = []
     for e in rows:
         ch = db.get(Chapter, e.chapter_id)
@@ -83,11 +144,25 @@ def teacher_list_exams(
     chapter_id: int | None = Query(default=None),
     user_id: int | None = Query(default=None),
     class_id: int | None = Query(default=None),
+    agent_id: int | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     size: int = Query(default=20, ge=1, le=200),
 ) -> dict:
     """教师查看所管班级学生的考核记录（含分数）。"""
-    _, allowed_students = resolve_teacher_scope(db, user, class_id)
+    from ..services.agent_access import get_teacher_agent_bound_classes
+
+    if agent_id and user.role == "teacher":
+        bound = get_teacher_agent_bound_classes(db, user, agent_id)
+        if class_id:
+            if class_id not in bound:
+                raise HTTPException(403, "该班级未绑定当前智能体")
+            _, allowed_students = resolve_teacher_scope(db, user, class_id)
+        elif bound:
+            allowed_students = get_class_student_ids(db, bound)
+        else:
+            return {"total": 0, "page": page, "size": size, "items": []}
+    else:
+        _, allowed_students = resolve_teacher_scope(db, user, class_id)
     if not allowed_students:
         return {"total": 0, "page": page, "size": size, "items": []}
     base = select(Exam).where(Exam.user_id.in_(allowed_students))
@@ -128,7 +203,10 @@ def teacher_get_report(exam_id: int, user: CurrentUser, db: DBSession) -> dict:
     exam = db.get(Exam, exam_id)
     if not exam:
         raise HTTPException(404, "考核不存在")
-    assert_teacher_can_view_student(db, user, exam.user_id)
+    if exam.user_id != user.id:
+        assert_teacher_can_view_student(db, user, exam.user_id)
+    elif user.role not in ("teacher", "admin"):
+        raise HTTPException(403, "无权查看")
     if exam.status != "submitted":
         raise HTTPException(400, "尚未提交")
     report = db.scalar(select(ExamReport).where(ExamReport.exam_id == exam_id))
@@ -149,7 +227,156 @@ def teacher_get_report(exam_id: int, user: CurrentUser, db: DBSession) -> dict:
         "weak_points": report.weak_points or [],
         "created_at": report.created_at.isoformat() if report.created_at else None,
         "questions": exam_service.exam_to_dict(exam)["questions"],
+        "feedback_meta": exam_feedback_service.get_report_feedback_meta(
+            db, exam, exam.user_id, viewer=user,
+        ),
     }
+
+
+@router.get("/teacher/all/{exam_id}/questions/{idx}/followups", dependencies=[Depends(require_role("teacher", "admin"))])
+def teacher_list_question_followups(
+    exam_id: int, idx: int, user: CurrentUser, db: DBSession,
+) -> list:
+    exam = db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "考核不存在")
+    if exam.user_id != user.id:
+        assert_teacher_can_view_student(db, user, exam.user_id)
+    elif user.role not in ("teacher", "admin"):
+        raise HTTPException(403, "无权查看")
+    if exam.status != "submitted":
+        raise HTTPException(400, "尚未提交")
+    return exam_feedback_service.list_followups(db, exam.id, idx, exam.user_id)
+
+
+@router.post("/teacher/all/{exam_id}/questions/{idx}/grading-feedback", dependencies=[Depends(require_role("teacher", "admin"))])
+def teacher_submit_grading_review(
+    exam_id: int,
+    idx: int,
+    payload: GradingFeedbackIn,
+    user: CurrentUser,
+    db: DBSession,
+) -> dict:
+    exam = db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "考核不存在")
+    if exam.user_id != user.id:
+        assert_teacher_can_view_student(db, user, exam.user_id)
+    elif user.role not in ("teacher", "admin"):
+        raise HTTPException(403, "无权操作")
+    if exam.status != "submitted":
+        raise HTTPException(400, "尚未提交")
+    try:
+        return exam_feedback_service.submit_teacher_grading_review(
+            db, exam, idx, user, payload.verdict, payload.comment,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ---- 教师端：判卷争议介入 ----
+
+@router.get("/teacher/interventions/pending-count", dependencies=[Depends(require_role("teacher"))])
+def teacher_intervention_pending_count(user: CurrentUser, db: DBSession) -> dict:
+    managed = get_managed_class_ids(db, user) or []
+    if not managed:
+        return {"count": 0}
+    cnt = db.scalar(
+        select(func.count()).select_from(ExamIntervention).where(
+            ExamIntervention.class_id.in_(managed),
+            ExamIntervention.status == "pending",
+        )
+    ) or 0
+    return {"count": cnt}
+
+
+@router.get("/teacher/interventions", dependencies=[Depends(require_role("teacher"))])
+def teacher_list_interventions(
+    user: CurrentUser,
+    db: DBSession,
+    status: str | None = Query(default="pending"),
+    class_id: int | None = Query(default=None),
+    agent_id: int | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    from ..services.agent_access import get_teacher_agent_bound_classes
+
+    managed = get_managed_class_ids(db, user) or []
+    if agent_id and user.role == "teacher":
+        managed = get_teacher_agent_bound_classes(db, user, agent_id)
+    if class_id is not None and class_id not in managed:
+        raise HTTPException(403, "无权查看该班级")
+    return exam_feedback_service.list_teacher_interventions(
+        db, user, managed, status=status, class_id=class_id, page=page, size=size,
+    )
+
+
+@router.get("/teacher/interventions/{iv_id}", dependencies=[Depends(require_role("teacher"))])
+def teacher_get_intervention(iv_id: int, user: CurrentUser, db: DBSession) -> dict:
+    iv = exam_feedback_service.get_intervention_detail(db, iv_id)
+    if not iv:
+        raise HTTPException(404, "申请不存在")
+    managed = get_managed_class_ids(db, user) or []
+    if iv.class_id not in managed:
+        raise HTTPException(403, "无权查看")
+    exam = db.get(Exam, iv.exam_id)
+    student = db.get(User, iv.student_id)
+    ch = db.get(Chapter, exam.chapter_id) if exam else None
+    resolver = db.get(User, iv.resolved_by) if iv.resolved_by else None
+    return {
+        "id": iv.id,
+        "exam_id": iv.exam_id,
+        "question_idx": iv.question_idx,
+        "student_id": iv.student_id,
+        "student_name": student.display_name if student else "",
+        "student_username": student.username if student else "",
+        "chapter_title": ch.title if ch else "",
+        "class_id": iv.class_id,
+        "trigger": iv.trigger,
+        "status": iv.status,
+        "student_message": iv.student_message,
+        "teacher_response": iv.teacher_response,
+        "resolved_by_id": iv.resolved_by,
+        "resolved_by_name": (resolver.display_name or resolver.username) if resolver else "",
+        "context": exam_feedback_service.enrich_intervention_context(db, iv),
+        "resolved_score": iv.resolved_score,
+        "created_at": iv.created_at.isoformat() if iv.created_at else None,
+        "resolved_at": iv.resolved_at.isoformat() if iv.resolved_at else None,
+        "report_url": f"/teacher/exams/{iv.exam_id}/report",
+    }
+
+
+class InterventionResolveIn(BaseModel):
+    action: str = "resolved"  # 仅支持 resolved
+    teacher_response: str = ""
+    resolved_score: float | None = None
+    student_feedback_correct: bool | None = None
+
+
+@router.put("/teacher/interventions/{iv_id}", dependencies=[Depends(require_role("teacher"))])
+def teacher_resolve_intervention(
+    iv_id: int,
+    payload: InterventionResolveIn,
+    user: CurrentUser,
+    db: DBSession,
+) -> dict:
+    iv = exam_feedback_service.get_intervention_detail(db, iv_id)
+    if not iv:
+        raise HTTPException(404, "申请不存在")
+    assert_teacher_manages_class(db, user, iv.class_id)
+    if payload.action != "resolved":
+        raise HTTPException(400, "教师只能确认处理介入申请")
+    try:
+        return exam_feedback_service.resolve_intervention(
+            db, iv, user,
+            action=payload.action,
+            teacher_response=payload.teacher_response,
+            resolved_score=payload.resolved_score,
+            student_feedback_correct=payload.student_feedback_correct,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.get("/teacher/students", dependencies=[Depends(require_role("teacher"))])
@@ -191,9 +418,14 @@ def get_config(
     user: CurrentUser,
     db: DBSession,
     class_id: int = Query(...),
+    agent_id: int | None = Query(default=None),
 ) -> dict:
-    cid = resolve_config_class_id(db, user, class_id)
-    cfg = get_exam_config(db, chapter_id, cid)
+    cid = resolve_config_class_id(db, user, class_id, agent_id=agent_id)
+    chapter = db.get(Chapter, chapter_id)
+    agent = resolve_agent_for_exam(
+        db, user, cid, chapter.course_id if chapter else None, agent_id,
+    )
+    cfg = get_shared_exam_config(db, chapter_id, cid, agent)
     if not cfg:
         return {"chapter_id": chapter_id, "class_id": cid, "config": {}, "max_attempts": 0}
     return {
@@ -233,13 +465,22 @@ def get_attempts(
     user: CurrentUser,
     db: DBSession,
     class_id: int | None = Query(default=None),
+    agent_id: int | None = Query(default=None),
 ) -> dict:
     """返回当前用户在指定章节的考核次数、上限、剩余次数。"""
+    chapter = db.get(Chapter, chapter_id)
     if user.role == "student":
-        cid = resolve_config_class_id(db, user)
+        cid = resolve_config_class_id(
+            db, user,
+            class_id=class_id,
+            course_id=chapter.course_id if chapter else None,
+        )
     else:
-        cid = resolve_config_class_id(db, user, class_id)
-    cfg = get_exam_config(db, chapter_id, cid)
+        cid = resolve_config_class_id(db, user, class_id, agent_id=agent_id)
+    agent = resolve_agent_for_exam(
+        db, user, cid, chapter.course_id if chapter else None, agent_id,
+    )
+    cfg = get_shared_exam_config(db, chapter_id, cid, agent)
     max_attempts = cfg.max_attempts if cfg else 0
     count = db.scalar(
         select(func.count()).select_from(
@@ -267,12 +508,27 @@ def teacher_class_progress(
     user: CurrentUser,
     db: DBSession,
     class_id: int = Query(...),
+    course_id: int | None = Query(default=None),
+    agent_id: int | None = Query(default=None),
 ) -> dict:
     """教师查看所管班级各章节考核完成率。"""
-    resolve_config_class_id(db, user, class_id)
+    resolve_config_class_id(db, user, class_id, agent_id=agent_id)
     _, student_ids = resolve_teacher_scope(db, user, class_id)
     student_count = len(student_ids)
-    chapters = db.scalars(select(Chapter).order_by(Chapter.order_idx, Chapter.id)).all()
+    cq = select(Chapter).order_by(Chapter.order_idx, Chapter.id)
+    if course_id is not None:
+        cq = cq.where(Chapter.course_id == course_id)
+    if course_id is not None and uses_course_level_preset_chapters(db, course_id, agent_id):
+        cq = cq.where(Chapter.agent_id.is_(None))
+        chapters = db.scalars(cq).all()
+    elif course_id is not None and requires_agent_scoped_chapters(db, course_id, agent_id):
+        if agent_id is None:
+            chapters = []
+        else:
+            cq = cq.where(agent_scoped_chapter_condition(db, course_id, agent_id))
+            chapters = db.scalars(cq).all()
+    else:
+        chapters = db.scalars(cq).all()
     chapter_stats = []
     for ch in chapters:
         completed_count = 0
@@ -323,15 +579,29 @@ def list_bank(
     db: DBSession,
     chapter_id: int | None = None,
     class_id: int | None = Query(default=None),
+    course_id: int | None = Query(default=None),
+    agent_id: int | None = Query(default=None),
 ) -> list[dict]:
-    allowed_classes = resolve_resource_class_ids(db, user, class_id)
+    allowed_classes = resolve_resource_class_ids_for_agent(
+        db, user, class_id, agent_id=agent_id,
+    )
+    agent = db.get(Agent, agent_id) if agent_id else None
     q = select(QuestionBank).order_by(QuestionBank.id.desc())
     if chapter_id:
         q = q.where(QuestionBank.chapter_id == chapter_id)
-    if allowed_classes is not None:
-        if not allowed_classes:
+    if course_id is not None:
+        if not requires_agent_scoped_chapters(db, course_id, agent_id):
+            chapter_ids = db.scalars(
+                select(Chapter.id).where(Chapter.course_id == course_id)
+            ).all()
+            if not chapter_ids:
+                return []
+            q = q.where(QuestionBank.chapter_id.in_(chapter_ids))
+        elif agent_id is None:
             return []
-        q = q.where(QuestionBank.class_id.in_(allowed_classes))
+    q = apply_agent_content_scope(QuestionBank, q, agent, allowed_classes, db=db)
+    if q is None:
+        return []
     rows = db.scalars(q).all()
     return [
         {
@@ -404,20 +674,47 @@ class KPIn(BaseModel):
     name: str
 
 
+@router.get("/knowledge-points/{chapter_id}/suggest", dependencies=[Depends(require_role("teacher", "admin"))])
+def suggest_kps(
+    chapter_id: int,
+    user: CurrentUser,
+    db: DBSession,
+    class_id: int = Query(...),
+    agent_id: int | None = Query(default=None),
+) -> dict:
+    """从章节资料（知识库）自动生成知识点建议，供教师选择性添加。"""
+    resolve_config_class_id(db, user, class_id, agent_id=agent_id)
+    try:
+        return kp_suggest_service.suggest_knowledge_points(
+            db, user, chapter_id, class_id, agent_id=agent_id,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @router.get("/knowledge-points/{chapter_id}")
 def list_kps(
     chapter_id: int,
     user: CurrentUser,
     db: DBSession,
     class_id: int | None = Query(default=None),
+    agent_id: int | None = Query(default=None),
 ) -> list[dict]:
-    cid = resolve_config_class_id(db, user, class_id)
-    rows = db.scalars(
-        select(KnowledgePoint).where(
-            KnowledgePoint.chapter_id == chapter_id,
-            KnowledgePoint.class_id == cid,
-        )
-    ).all()
+    cid = resolve_config_class_id(db, user, class_id, agent_id=agent_id)
+    chapter = db.get(Chapter, chapter_id)
+    agent = resolve_agent_for_exam(
+        db, user, cid, chapter.course_id if chapter else None, agent_id,
+    )
+    class_ids = resolve_bank_class_ids(db, agent, cid)
+    kp_q = select(KnowledgePoint).where(KnowledgePoint.chapter_id == chapter_id)
+    if agent and is_adopted_snapshot(agent):
+        kp_q = kp_q.where(or_(
+            KnowledgePoint.agent_id == agent.id,
+            KnowledgePoint.class_id.in_(class_ids),
+        ))
+    else:
+        kp_q = kp_q.where(KnowledgePoint.class_id.in_(class_ids))
+    rows = db.scalars(kp_q).all()
     return [{"id": r.id, "name": r.name} for r in rows]
 
 
@@ -546,13 +843,143 @@ def regenerate_report(exam_id: int, user: CurrentUser, db: DBSession) -> dict:
     return {"exam_id": exam.id, "report_id": report.id, "total_score": report.total_score}
 
 
-@router.get("/{exam_id}/report")
-def get_report(exam_id: int, user: CurrentUser, db: DBSession) -> dict:
-    exam = db.get(Exam, exam_id)
+def _assert_student_submitted_exam(exam: Exam | None, user: User) -> Exam:
     if not exam or exam.user_id != user.id:
         raise HTTPException(404, "考核不存在")
     if exam.status != "submitted":
-        raise HTTPException(400, "尚未提交")
+        raise HTTPException(400, "考核尚未提交")
+    return exam
+
+
+class QuestionAskIn(BaseModel):
+    question: str
+
+
+@router.post("/{exam_id}/questions/{idx}/ask")
+async def ask_about_question(
+    exam_id: int,
+    idx: int,
+    payload: QuestionAskIn,
+    user: CurrentUser,
+    db: DBSession,
+):
+    """考核报告单题追问 SSE：推荐资料 + 流式回答。"""
+    exam = _assert_student_submitted_exam(db.get(Exam, exam_id), user)
+    if not (payload.question or "").strip():
+        raise HTTPException(400, "请输入问题")
+    chapter = db.get(Chapter, exam.chapter_id)
+    course_id = chapter.course_id if chapter else None
+    class_id = get_student_class_for_course(db, user, course_id) if course_id else None
+    class_ids = [class_id] if class_id else None
+
+    try:
+        llm, stream, recommendations = await exam_feedback_service.prepare_question_ask(
+            db, exam, idx, user, payload.question.strip(), class_ids, course_id,
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+    started = time.time()
+
+    async def gen():
+        full: list[str] = []
+        try:
+            yield {
+                "event": "recommend",
+                "data": json.dumps({"recommendations": recommendations}, ensure_ascii=False),
+            }
+            async for token in stream:
+                full.append(token)
+                yield {"event": "message", "data": json.dumps({"text": token}, ensure_ascii=False)}
+            yield {"event": "message", "data": "[DONE]"}
+            answer = "".join(full)
+            exam_feedback_service.save_followup(
+                db, exam.id, idx, user.id, payload.question.strip(), answer, recommendations,
+            )
+        except Exception as e:
+            yield {"event": "error", "data": json.dumps({"text": f"LLM 调用失败: {e}"}, ensure_ascii=False)}
+        finally:
+            latency = int((time.time() - started) * 1000)
+            log_call(
+                db, endpoint=f"/api/exams/{exam_id}/questions/{idx}/ask", user_id=user.id,
+                req_summary=f"[exam:{exam_id} Q{idx}] {payload.question[:80]}",
+                resp_summary="".join(full)[:200],
+                model_name=llm.model,
+                answer_full="".join(full),
+                latency_ms=latency,
+            )
+
+    return EventSourceResponse(gen())
+
+
+@router.get("/{exam_id}/questions/{idx}/followups")
+def list_question_followups(exam_id: int, idx: int, user: CurrentUser, db: DBSession) -> list:
+    exam = _assert_student_submitted_exam(db.get(Exam, exam_id), user)
+    return exam_feedback_service.list_followups(db, exam.id, idx, user.id)
+
+
+@router.post("/{exam_id}/questions/{idx}/grading-feedback")
+def submit_grading_feedback(
+    exam_id: int,
+    idx: int,
+    payload: GradingFeedbackIn,
+    user: CurrentUser,
+    db: DBSession,
+) -> dict:
+    exam = _assert_student_submitted_exam(db.get(Exam, exam_id), user)
+    try:
+        return exam_feedback_service.submit_grading_feedback(
+            db, exam, idx, user, payload.verdict, payload.comment,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+class InterventionRequestIn(BaseModel):
+    message: str = ""
+
+
+@router.post("/{exam_id}/questions/{idx}/intervention")
+def request_intervention(
+    exam_id: int,
+    idx: int,
+    payload: InterventionRequestIn,
+    user: CurrentUser,
+    db: DBSession,
+) -> dict:
+    exam = _assert_student_submitted_exam(db.get(Exam, exam_id), user)
+    try:
+        return exam_feedback_service.request_teacher_intervention(
+            db, exam, idx, user, payload.message,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.get("/{exam_id}/questions/{idx}/intervention")
+def get_intervention(
+    exam_id: int,
+    idx: int,
+    user: CurrentUser,
+    db: DBSession,
+) -> dict:
+    exam = _assert_student_submitted_exam(db.get(Exam, exam_id), user)
+    row = exam_feedback_service.get_student_intervention(db, exam, idx, user)
+    if not row:
+        raise HTTPException(404, "该题暂无教师介入申请")
+    return row
+
+
+@router.get("/{exam_id}/feedback-meta")
+def get_feedback_meta(exam_id: int, user: CurrentUser, db: DBSession) -> dict:
+    exam = _assert_student_submitted_exam(db.get(Exam, exam_id), user)
+    meta = exam_feedback_service.get_report_feedback_meta(db, exam, user.id, viewer=user)
+    return meta
+
+
+@router.get("/{exam_id}/report")
+def get_report(exam_id: int, user: CurrentUser, db: DBSession) -> dict:
+    exam = _assert_student_submitted_exam(db.get(Exam, exam_id), user)
     report = db.scalar(select(ExamReport).where(ExamReport.exam_id == exam_id))
     if not report:
         raise HTTPException(404, "报告尚未生成")
@@ -566,6 +993,9 @@ def get_report(exam_id: int, user: CurrentUser, db: DBSession) -> dict:
         "weak_points": report.weak_points or [],
         "created_at": report.created_at.isoformat() if report.created_at else None,
         "questions": exam_service.exam_to_dict(exam)["questions"],
+        "feedback_meta": exam_feedback_service.get_report_feedback_meta(
+            db, exam, user.id, viewer=user,
+        ),
     }
 
 

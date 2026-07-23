@@ -1,15 +1,30 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import http from '@/api'
+import { useCourseSelect, type CourseItem } from '@/composables/useCourseSelect'
 
 interface ClassItem {
   id: number
   name: string
   invite_code: string
+  course_id: number | null
+  course_name: string | null
   student_count: number
   teacher_count: number
   created_at: string | null
+}
+
+interface ClassAgent {
+  id: number
+  name: string
+  course_name: string
+  status: string
+  is_adopted: boolean
+  assigned: boolean
+  owner_name?: string
+  is_mine?: boolean
+  editable?: boolean
 }
 
 interface Member {
@@ -28,6 +43,18 @@ const detailPanelRef = ref<HTMLElement | null>(null)
 
 const createDialog = ref(false)
 const createName = ref('')
+const createCourseId = ref<number | undefined>(undefined)
+const courses = ref<CourseItem[]>([])
+const { resolveCourseSelection } = useCourseSelect(courses)
+const classAgents = ref<ClassAgent[]>([])
+const agentSaving = ref(false)
+const selectedAgentIds = ref<number[]>([])
+const courseFilter = ref<number | undefined>(undefined)
+
+const filteredClasses = computed(() => {
+  if (!courseFilter.value) return classes.value
+  return classes.value.filter(c => c.course_id === courseFilter.value)
+})
 const editDialog = ref(false)
 const editName = ref('')
 const editingClassId = ref<number | undefined>(undefined)
@@ -82,21 +109,27 @@ async function loadDetail() {
   if (!classId) {
     students.value = []
     teachers.value = []
+    classAgents.value = []
+    selectedAgentIds.value = []
     detailLoading.value = false
     return
   }
   const seq = ++detailSeq
   students.value = []
   teachers.value = []
+  classAgents.value = []
   detailLoading.value = true
   try {
-    const [st, te] = await Promise.all([
+    const [st, te, ag] = await Promise.all([
       http.get<Member[]>(`/classes/${classId}/students`),
       http.get<Member[]>(`/classes/${classId}/teachers`),
+      http.get<ClassAgent[]>(`/classes/${classId}/agents`).catch(() => ({ data: [] as ClassAgent[] })),
     ])
     if (seq !== detailSeq || selectedId.value !== classId) return
     students.value = st.data
     teachers.value = te.data
+    classAgents.value = ag.data
+    selectedAgentIds.value = ag.data.filter(a => a.is_mine !== false && a.assigned).map(a => a.id)
   } catch (e: any) {
     if (seq === detailSeq && selectedId.value === classId) {
       students.value = []
@@ -223,23 +256,60 @@ async function submitAddAssistant(username?: string) {
   }
 }
 
+function onCreateCourseChange(val: number | string | null | undefined) {
+  resolveCourseSelection(val, id => { createCourseId.value = id ?? undefined })
+}
+
 async function createClass() {
   const name = createName.value.trim()
   if (!name) {
     ElMessage.warning('请输入班级名称')
     return
   }
+  if (!createCourseId.value) {
+    ElMessage.warning('请选择课程')
+    return
+  }
   try {
-    const { data } = await http.post<ClassItem>('/classes', { name })
+    const { data } = await http.post<ClassItem>('/classes', {
+      name,
+      course_id: createCourseId.value,
+    })
     ElMessage.success('班级已创建')
     createDialog.value = false
     createName.value = ''
+    createCourseId.value = undefined
     await loadClasses()
     selectedId.value = data.id
     await nextTick()
     await loadDetail()
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.detail || '创建失败')
+  }
+}
+
+async function saveClassAgents() {
+  if (!selectedId.value) return
+  agentSaving.value = true
+  try {
+    await http.put(`/classes/${selectedId.value}/agents`, {
+      agent_ids: selectedAgentIds.value,
+    })
+    ElMessage.success('智能体分配已保存')
+    await loadDetail()
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '保存失败')
+  } finally {
+    agentSaving.value = false
+  }
+}
+
+async function loadCourses() {
+  try {
+    const { data } = await http.get<CourseItem[]>('/courses')
+    courses.value = data
+  } catch {
+    courses.value = []
   }
 }
 
@@ -329,7 +399,10 @@ async function removeTeacher(row: Member) {
 
 const selectedClass = () => classes.value.find(c => c.id === selectedId.value)
 
-onMounted(refreshClassList)
+onMounted(() => {
+  void loadCourses()
+  void refreshClassList()
+})
 </script>
 
 <template>
@@ -338,12 +411,21 @@ onMounted(refreshClassList)
       <template #header>
         <div class="card-header">
           <span>班级管理</span>
-          <el-button type="primary" size="small" @click="createDialog = true">创建班级</el-button>
+          <el-button type="primary" size="small" @click="createDialog = true; loadCourses()">创建班级</el-button>
         </div>
       </template>
 
+      <el-select
+        v-model="courseFilter"
+        clearable
+        placeholder="按课程筛选"
+        style="width: 220px; margin-bottom: 12px"
+      >
+        <el-option v-for="c in courses" :key="c.id" :label="c.name" :value="c.id" />
+      </el-select>
+
       <el-table
-        :data="classes"
+        :data="filteredClasses"
         row-key="id"
         size="small"
         border
@@ -352,7 +434,8 @@ onMounted(refreshClassList)
         :row-class-name="rowClassName"
         @row-click="onRowClick"
       >
-        <el-table-column label="班级" prop="name" min-width="180" class-name="clickable-cell" />
+        <el-table-column label="班级" prop="name" min-width="160" class-name="clickable-cell" />
+        <el-table-column label="课程" prop="course_name" min-width="140" class-name="clickable-cell" />
         <el-table-column label="学生数" prop="student_count" width="80" align="center" class-name="clickable-cell" />
         <el-table-column label="教师数" prop="teacher_count" width="80" align="center" class-name="clickable-cell" />
         <el-table-column label="邀请码（点击即可复制）" width="160" align="center">
@@ -403,6 +486,53 @@ onMounted(refreshClassList)
 
       <section class="detail-section">
         <div class="section-header">
+          <h4>课程智能体</h4>
+          <el-button
+            size="small"
+            type="primary"
+            :loading="agentSaving"
+            :disabled="!classAgents.length"
+            @click="saveClassAgents"
+          >
+            保存分配
+          </el-button>
+        </div>
+        <p v-if="!selectedClass()?.course_id" class="hint-text">
+          该班级尚未绑定课程，无法分配智能体。
+        </p>
+        <el-checkbox-group
+          v-else
+          v-model="selectedAgentIds"
+          class="agent-check-group"
+        >
+          <el-checkbox
+            v-for="a in classAgents.filter(x => x.is_mine !== false)"
+            :key="a.id"
+            :label="a.id"
+            :value="a.id"
+          >
+            {{ a.name }}
+            <el-tag v-if="a.is_adopted" size="small" type="info" style="margin-left: 6px">采纳</el-tag>
+            <el-tag v-if="a.status !== 'active'" size="small" type="warning" style="margin-left: 6px">未上线</el-tag>
+          </el-checkbox>
+          <div
+            v-for="a in classAgents.filter(x => x.is_mine === false)"
+            :key="'other-' + a.id"
+            class="other-agent-row"
+          >
+            <el-tag type="info" size="small">{{ a.name }}</el-tag>
+            <span class="other-agent-owner">（{{ a.owner_name }} 已分配）</span>
+          </div>
+        </el-checkbox-group>
+        <el-empty
+          v-if="selectedClass()?.course_id && !classAgents.length"
+          description="您暂无该课程可分配的智能体（需拥有或从共享广场采纳）"
+          :image-size="60"
+        />
+      </section>
+
+      <section class="detail-section">
+        <div class="section-header">
           <h4>助教管理</h4>
           <el-button size="small" type="primary" @click="openAssistantDialog">添加助教</el-button>
         </div>
@@ -424,8 +554,26 @@ onMounted(refreshClassList)
     </el-card>
   </div>
 
-  <el-dialog v-model="createDialog" title="创建班级" width="400px">
-    <el-input v-model="createName" placeholder="班级名称，如 2025软院C语言1班" />
+  <el-dialog v-model="createDialog" title="创建班级" width="420px">
+    <el-form label-width="72px">
+      <el-form-item label="课程" required>
+        <el-select
+          :model-value="createCourseId"
+          filterable
+          allow-create
+          default-first-option
+          clearable
+          placeholder="选择已有课程，或直接输入新课程名称"
+          style="width: 100%"
+          @update:model-value="onCreateCourseChange"
+        >
+          <el-option v-for="c in courses" :key="c.id" :label="c.name" :value="c.id" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="班级名" required>
+        <el-input v-model="createName" placeholder="如 2025软院C语言1班" />
+      </el-form-item>
+    </el-form>
     <template #footer>
       <el-button @click="createDialog = false">取消</el-button>
       <el-button type="primary" @click="createClass">创建</el-button>
@@ -445,7 +593,7 @@ onMounted(refreshClassList)
       size="small"
       border
       max-height="280"
-      empty-text="暂无可添加的学生（未加入任何班级的学生账号）"
+      empty-text="暂无可添加的学生（已在该课程其他班级中的学生不可重复添加）"
     >
       <el-table-column label="用户名" prop="username" />
       <el-table-column label="姓名" prop="display_name" />
@@ -567,5 +715,27 @@ onMounted(refreshClassList)
   gap: 8px;
   margin-top: 16px;
   flex-wrap: wrap;
+}
+
+.hint-text {
+  margin: 0;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+}
+
+.agent-check-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.other-agent-row {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+  padding-left: 4px;
+}
+
+.other-agent-owner {
+  margin-left: 6px;
 }
 </style>

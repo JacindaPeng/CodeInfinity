@@ -10,7 +10,15 @@ interface UserRow {
   role: string
   class_id: number | null
   class_name: string | null
+  enrollments?: { class_id: number; class_name: string; course_id: number; course_name: string }[]
   created_at: string
+}
+
+function enrollmentLabel(row: UserRow) {
+  if (row.enrollments?.length) {
+    return row.enrollments.map(e => `${e.course_name}·${e.class_name}`).join('；')
+  }
+  return row.class_name || '—'
 }
 
 const list = ref<UserRow[]>([])
@@ -179,8 +187,8 @@ onMounted(load)
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="班级" width="160">
-        <template #default="{ row }">{{ row.class_name || '—' }}</template>
+      <el-table-column label="班级/选课" min-width="220">
+        <template #default="{ row }">{{ enrollmentLabel(row) }}</template>
       </el-table-column>
       <el-table-column label="注册时间" prop="created_at" width="180" />
       <el-table-column label="操作" width="240" fixed="right">

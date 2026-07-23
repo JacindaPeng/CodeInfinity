@@ -2,6 +2,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import http from '@/api'
+import { useCourseAgentStore } from '@/stores/courseAgent'
+import { useAgentBoundClasses } from '@/composables/useAgentBoundClasses'
 
 interface LogRow {
   id: number; user_id: number | null; username: string; display_name: string
@@ -22,11 +24,19 @@ const endpoint = ref('')
 const filterClass = ref<number | undefined>(undefined)
 const classes = ref<ClassItem[]>([])
 const loading = ref(false)
+const agentStore = useCourseAgentStore()
+const { loadScopedClasses, pickClassId } = useAgentBoundClasses()
 
 async function loadClasses() {
-  const url = isAdminMode.value ? '/admin/classes' : '/classes/mine'
-  const { data } = await http.get<ClassItem[]>(url)
+  if (isAdminMode.value) {
+    const { data } = await http.get<ClassItem[]>('/admin/classes')
+    classes.value = data
+    return
+  }
+  await agentStore.restoreAgent()
+  const data = await loadScopedClasses()
   classes.value = data
+  filterClass.value = pickClassId(data, filterClass.value)
 }
 
 async function load() {

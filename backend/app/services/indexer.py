@@ -15,11 +15,15 @@ def _get_chapter_title(db: Session, chapter_id: int) -> str:
 
 def index_material(db: Session, material: Material) -> int:
     """索引单个资料，返回写入 chunk 数。"""
-    chapter_title = _get_chapter_title(db, material.chapter_id)
+    chapter = db.get(Chapter, material.chapter_id)
+    chapter_title = chapter.title if chapter else ""
+    course_id = chapter.course_id if chapter else ""
     base_meta = {
         "material_id": material.id,
         "chapter_id": material.chapter_id,
+        "course_id": course_id,
         "class_id": material.class_id or "",
+        "agent_id": material.agent_id or "",
         "chapter_title": chapter_title,
         "type": material.type,
         "title": material.title,
@@ -51,6 +55,9 @@ def index_material(db: Session, material: Material) -> int:
     ids = [f"m{material.id}-c{i}" for i in range(len(chunks))]
     vector_store.add_chunks(docs, metas, ids)
     db.commit()
+    if course_id:
+        from .agent_service import maybe_activate_course_agent
+        maybe_activate_course_agent(db, int(course_id))
     return len(chunks)
 
 
@@ -136,10 +143,14 @@ def index_pdf_pages(
     直接使用 PDF 页码（不做印刷页码转换，避免 OCR 误差）。
     """
     chapter_title = _get_chapter_title(db, material.chapter_id)
+    chapter = db.get(Chapter, material.chapter_id)
+    course_id = chapter.course_id if chapter else ""
     base_meta = {
         "material_id": material.id,
         "chapter_id": material.chapter_id,
+        "course_id": course_id,
         "class_id": material.class_id or "",
+        "agent_id": material.agent_id or "",
         "chapter_title": chapter_title,
         "type": "pdf",
         "title": material.title,
@@ -175,17 +186,20 @@ def index_pdf_pages(
     ids = [f"m{material.id}-p{start}-c{i}" for i in range(len(chunks))]
     vector_store.add_chunks(docs, metas, ids)
     db.commit()
+    if course_id:
+        from .agent_service import maybe_activate_course_agent
+        maybe_activate_course_agent(db, int(course_id))
     return len(chunks)
 
 
 def reindex_all(db: Session, class_ids: list[int] | None = None) -> dict:
     """重建索引。class_ids 为 None 时全量重建；否则仅重建所管班级资料。"""
-    q = db.query(Material)
+    q = select(Material)
     if class_ids is not None:
         if not class_ids:
             return {"materials": 0, "chunks": 0}
-        q = q.filter(Material.class_id.in_(class_ids))
-    materials = q.all()
+        q = q.where(Material.class_id.in_(class_ids))
+    materials = list(db.scalars(q).all())
 
     if class_ids is None:
         vector_store.reset_collection()
@@ -203,4 +217,22 @@ def reindex_all(db: Session, class_ids: list[int] | None = None) -> dict:
             total += index_material(db, m)
         except Exception as e:
             print(f"[reindex] material {m.id} failed: {e}")
+    return {"materials": len(materials), "chunks": total}
+
+
+def reindex_videos(db: Session, class_ids: list[int] | None = None) -> dict:
+    """仅重建视频资料（换 Whisper 模型后用）。保留 PDF 索引不动。"""
+    q = select(Material).where(Material.type == "video")
+    if class_ids is not None:
+        if not class_ids:
+            return {"materials": 0, "chunks": 0}
+        q = q.where(Material.class_id.in_(class_ids))
+    materials = list(db.scalars(q).all())
+
+    total = 0
+    for m in materials:
+        try:
+            total += index_material(db, m)
+        except Exception as e:
+            print(f"[reindex-videos] material {m.id} failed: {e}")
     return {"materials": len(materials), "chunks": total}

@@ -19,8 +19,14 @@ chroma/
 .vscode/
 *.log
 
+# 临时 / 误生成文件
+*_preview.txt
+~$*
+code-security.datadog.yaml
+
 # 本地课程资料（不上传仓库）
 程序设计基础与C程序设计/
 *.doc
 *.docx
 *.wps
+PL_Course/

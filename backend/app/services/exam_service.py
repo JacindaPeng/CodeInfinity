@@ -12,10 +12,11 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from ..models import (
+    Agent,
     Chapter,
     ChapterProgress,
     Exam,
@@ -27,15 +28,33 @@ from ..models import (
     User,
 )
 from ..deps import get_exam_config
+from .agent_access import get_shared_exam_config, is_adopted_snapshot, resolve_agent_for_exam, resolve_bank_class_ids
 from .llm_provider import get_provider
 
 TYPE_LABEL = {"选择题": "选择题", "判断题": "判断题", "简答题": "简答题"}
 
 
-def _get_kp_names(db: Session, chapter_id: int, class_id: int | None = None) -> list[str]:
+def _get_kp_names(
+    db: Session,
+    chapter_id: int,
+    class_id: int | None = None,
+    extra_class_ids: list[int] | None = None,
+    agent: Agent | None = None,
+) -> list[str]:
+    class_ids = list(dict.fromkeys(
+        ([class_id] if class_id else []) + (extra_class_ids or [])
+    ))
     q = select(KnowledgePoint).where(KnowledgePoint.chapter_id == chapter_id)
-    if class_id:
-        q = q.where(KnowledgePoint.class_id == class_id)
+    if agent and is_adopted_snapshot(agent):
+        if class_ids:
+            q = q.where(or_(
+                KnowledgePoint.agent_id == agent.id,
+                KnowledgePoint.class_id.in_(class_ids),
+            ))
+        else:
+            q = q.where(KnowledgePoint.agent_id == agent.id)
+    elif class_ids:
+        q = q.where(KnowledgePoint.class_id.in_(class_ids))
     rows = db.scalars(q).all()
     return [r.name for r in rows]
 
@@ -114,17 +133,31 @@ def generate_paper(
     class_id: int | None = None,
     *,
     teacher_test: bool = False,
+    agent_id: int | None = None,
 ) -> tuple[Exam, list[str]]:
     """按章节考核配置生成试卷。返回 (exam, warnings)。"""
     chapter = db.get(Chapter, chapter_id)
     if not chapter:
         raise ValueError("章节不存在")
-    effective_class_id = class_id or user.class_id
+    effective_class_id = class_id
     if not effective_class_id:
-        raise ValueError("尚未加入班级，无法开始考核")
-    cfg = get_exam_config(db, chapter_id, effective_class_id)
+        if user.role == "student" and chapter.course_id:
+            from .enrollment import get_student_class_for_course
+            effective_class_id = get_student_class_for_course(db, user, chapter.course_id)
+    if not effective_class_id:
+        raise ValueError("尚未加入该课程班级，无法开始考核")
+
+    agent: Agent | None = resolve_agent_for_exam(
+        db, user, effective_class_id, chapter.course_id, agent_id,
+    )
+    cfg = get_shared_exam_config(db, chapter_id, effective_class_id, agent)
     if not cfg:
-        raise ValueError("该章节未为本班配置考核")
+        raise ValueError("该章节未为本班配置考核（共享源班级亦无配置）")
+
+    shared_class_ids = [
+        c for c in resolve_bank_class_ids(db, agent, effective_class_id)
+        if c != effective_class_id
+    ]
 
     # 检查考核次数上限（教师测试不受限）
     if not teacher_test and cfg.max_attempts and cfg.max_attempts > 0:
@@ -140,24 +173,31 @@ def generate_paper(
             raise ValueError(f"该章节考核次数已达上限（{cfg.max_attempts}次），无法再次开考")
 
     config: dict[str, Any] = cfg.config_json or {}
-    kp_names = config.get("knowledge_points") or _get_kp_names(db, chapter_id, effective_class_id)
+    kp_names = config.get("knowledge_points") or _get_kp_names(
+        db, chapter_id, effective_class_id, shared_class_ids, agent=agent,
+    )
     warnings: list[str] = []
 
     exam = Exam(user_id=user.id, chapter_id=chapter_id, status="ongoing")
     db.add(exam); db.flush()
 
     idx = 0
-    bank_class_filter = [QuestionBank.class_id == effective_class_id]
+    bank_class_ids = resolve_bank_class_ids(db, agent, effective_class_id)
     for qtype, count in config.items():
         if qtype == "knowledge_points" or not isinstance(count, int):
             continue
-        bank_rows = db.scalars(
-            select(QuestionBank).where(
-                QuestionBank.chapter_id == chapter_id,
-                QuestionBank.type == qtype,
-                *bank_class_filter,
-            )
-        ).all()
+        bank_q = select(QuestionBank).where(
+            QuestionBank.chapter_id == chapter_id,
+            QuestionBank.type == qtype,
+        )
+        if agent and is_adopted_snapshot(agent):
+            bank_q = bank_q.where(or_(
+                QuestionBank.agent_id == agent.id,
+                QuestionBank.class_id.in_(bank_class_ids),
+            ))
+        else:
+            bank_q = bank_q.where(QuestionBank.class_id.in_(bank_class_ids))
+        bank_rows = db.scalars(bank_q).all()
         random.shuffle(bank_rows)
         needed = count
         for bq in bank_rows[:needed]:

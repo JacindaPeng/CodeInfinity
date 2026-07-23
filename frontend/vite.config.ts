@@ -15,8 +15,9 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
-        timeout: 60000,
-        proxyTimeout: 60000,
+        // 整本教材上传/索引可能耗时数分钟，需与前端 axios timeout 对齐
+        timeout: 600000,
+        proxyTimeout: 600000,
       },
     },
   },

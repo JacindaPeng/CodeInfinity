@@ -10,7 +10,14 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import get_db
-from .models import CallLog, ClassTeacher, ExamConfig, Material, QuestionBank, User
+from .models import CallLog, ClassTeacher, ExamConfig, Material, QuestionBank, TeachingClass, User
+from .services.enrollment import (
+    assert_student_enrolled,
+    get_class_student_user_ids,
+    get_student_class_for_course,
+    get_student_class_ids,
+    get_student_enrollments,
+)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
@@ -57,24 +64,22 @@ def require_role(*roles: str):
 
 
 def get_managed_class_ids(db: Session, user: User) -> list[int] | None:
-    """admin 返回 None（不限制）；teacher 返回所管班级 id 列表。"""
+    """admin 返回 None（不限制）；teacher 返回所管班级 id 列表（含任教与自建）。"""
     if user.role == "admin":
         return None
     if user.role != "teacher":
         return []
-    rows = db.scalars(
+    linked = set(db.scalars(
         select(ClassTeacher.class_id).where(ClassTeacher.user_id == user.id)
-    ).all()
-    return list(rows)
+    ).all())
+    created = set(db.scalars(
+        select(TeachingClass.id).where(TeachingClass.created_by == user.id)
+    ).all())
+    return sorted(linked | created)
 
 
 def get_class_student_ids(db: Session, class_ids: list[int]) -> list[int]:
-    if not class_ids:
-        return []
-    rows = db.scalars(
-        select(User.id).where(User.role == "student", User.class_id.in_(class_ids))
-    ).all()
-    return list(rows)
+    return get_class_student_user_ids(db, class_ids)
 
 
 def resolve_teacher_scope(
@@ -109,9 +114,15 @@ def assert_teacher_can_view_student(db: Session, user: User, student_id: int) ->
     if user.role == "admin":
         return
     student = db.get(User, student_id)
-    if not student or student.role != "student" or not student.class_id:
+    if not student or student.role != "student":
         raise HTTPException(status_code=403, detail="无权查看该学生")
-    assert_teacher_manages_class(db, user, student.class_id)
+    managed = get_managed_class_ids(db, user) or []
+    enrolled = get_student_class_ids(db, student)
+    if enrolled and any(cid in managed for cid in enrolled):
+        return
+    if student.class_id and student.class_id in managed:
+        return
+    raise HTTPException(status_code=403, detail="无权查看该学生")
 
 
 def resolve_resource_class_ids(
@@ -134,9 +145,16 @@ def resolve_resource_class_ids(
             return [class_id]
         return managed
     if user.role == "student":
-        if not user.class_id:
+        class_ids = get_student_class_ids(db, user)
+        if not class_ids and user.class_id:
+            class_ids = [user.class_id]
+        if not class_ids:
             return []
-        return [user.class_id]
+        if class_id:
+            if class_id not in class_ids:
+                raise HTTPException(status_code=403, detail="无权访问该班级")
+            return [class_id]
+        return class_ids
     return []
 
 
@@ -174,21 +192,49 @@ def resolve_config_class_id(
     db: Session,
     user: User,
     class_id: int | None = None,
+    course_id: int | None = None,
+    agent_id: int | None = None,
 ) -> int:
     """考核配置/知识点/开考使用的单一班级 id。学生取所在班；教师/admin 需指定 class_id。"""
     if user.role == "student":
-        if not user.class_id:
-            raise HTTPException(status_code=400, detail="尚未加入班级，无法使用考核功能")
-        return user.class_id
+        if class_id:
+            assert_student_enrolled(db, user, class_id)
+            return class_id
+        if course_id:
+            cid = get_student_class_for_course(db, user, course_id)
+            if cid:
+                return cid
+        enrollments = get_student_enrollments(db, user)
+        if len(enrollments) == 1:
+            return enrollments[0].class_id
+        raise HTTPException(
+            status_code=400,
+            detail="尚未加入该课程班级或需指定班级，无法使用考核功能",
+        )
     if user.role == "teacher":
         managed = get_managed_class_ids(db, user) or []
-        if not managed:
-            raise HTTPException(status_code=403, detail="无权管理任何班级")
         if not class_id:
             raise HTTPException(status_code=400, detail="请指定班级")
-        if class_id not in managed:
-            raise HTTPException(status_code=403, detail="无权访问该班级")
-        return class_id
+        if class_id in managed:
+            if agent_id:
+                from .services.agent_access import assert_teacher_class_bound_to_agent
+                assert_teacher_class_bound_to_agent(db, user, agent_id, class_id)
+            return class_id
+        # 体验他人共享智能体：可读源侧考核配置（只读浏览）
+        if agent_id:
+            from .services.agent_access import (
+                assert_agent_access,
+                get_shared_content_class_ids,
+                is_shared_agent_preview,
+            )
+            agent = assert_agent_access(db, user, agent_id)
+            if is_shared_agent_preview(agent, user):
+                shared_ids = get_shared_content_class_ids(db, agent)
+                if class_id in shared_ids:
+                    return class_id
+        if not managed:
+            raise HTTPException(status_code=403, detail="无权管理任何班级")
+        raise HTTPException(status_code=403, detail="无权访问该班级")
     if user.role == "admin":
         if not class_id:
             raise HTTPException(status_code=400, detail="请指定班级")

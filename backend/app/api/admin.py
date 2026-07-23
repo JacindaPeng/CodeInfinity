@@ -1,21 +1,30 @@
 """系统管理员 API：用户管理、全站监控。"""
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, field_validator
 from sqlalchemy import delete, func, select
 
 from ..deps import CurrentUser, DBSession, require_role
 from ..models import (
+    Agent,
+    AgentClass,
     CallLog,
     Chapter,
+    ClassEnrollment,
     ClassTeacher,
+    Course,
     Exam,
     ExamReport,
     TeachingClass,
     User,
 )
+from ..services.enrollment import get_class_student_user_ids
 from ..schemas import AdminResetPasswordIn, AdminUserCreate, AdminUserUpdate, UserOut, build_user_out
 from ..schemas.classes import ClassOut
 from ..security import hash_password
-from ..services import exam_service
+from ..services import exam_service, exam_feedback_service
+from .agents import _agent_dict
 from .classes import _class_to_out
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_role("admin"))])
@@ -108,6 +117,7 @@ def delete_user(user_id: int, admin: CurrentUser, db: DBSession) -> dict:
     if not user:
         raise HTTPException(404, "用户不存在")
     _assert_not_last_admin(db, user)
+    db.execute(delete(ClassEnrollment).where(ClassEnrollment.user_id == user_id))
     user.class_id = None
     db.execute(delete(ClassTeacher).where(ClassTeacher.user_id == user_id))
     db.delete(user)
@@ -146,9 +156,7 @@ def admin_list_exams(
 ) -> dict:
     base = select(Exam)
     if class_id:
-        student_ids = db.scalars(
-            select(User.id).where(User.role == "student", User.class_id == class_id)
-        ).all()
+        student_ids = get_class_student_user_ids(db, [class_id])
         if not student_ids:
             return {"total": 0, "page": page, "size": size, "items": []}
         base = base.where(Exam.user_id.in_(student_ids))
@@ -188,13 +196,16 @@ def admin_list_students(
 ) -> list[dict]:
     base = select(User).where(User.role == "student")
     if class_id:
-        base = base.where(User.class_id == class_id)
+        student_ids = get_class_student_user_ids(db, [class_id])
+        if not student_ids:
+            return []
+        base = base.where(User.id.in_(student_ids))
     rows = db.scalars(base.order_by(User.id)).all()
     return [{"id": u.id, "username": u.username, "display_name": u.display_name} for u in rows]
 
 
 @router.get("/exams/{exam_id}/report")
-def admin_get_report(exam_id: int, db: DBSession) -> dict:
+def admin_get_report(exam_id: int, user: CurrentUser, db: DBSession) -> dict:
     exam = db.get(Exam, exam_id)
     if not exam:
         raise HTTPException(404, "考核不存在")
@@ -218,7 +229,27 @@ def admin_get_report(exam_id: int, db: DBSession) -> dict:
         "weak_points": report.weak_points or [],
         "created_at": report.created_at.isoformat() if report.created_at else None,
         "questions": exam_service.exam_to_dict(exam)["questions"],
+        "feedback_meta": exam_feedback_service.get_report_feedback_meta(
+            db, exam, exam.user_id, viewer=user,
+        ),
+        "student_feedback_credit": (u.feedback_credit or 0) if u else 0,
     }
+
+
+# ---- AI 判卷反馈与训练监控 ----
+
+@router.get("/ai-feedback/overview")
+def admin_ai_feedback_overview(db: DBSession) -> dict:
+    return exam_feedback_service.get_admin_feedback_overview(db)
+
+
+@router.get("/ai-feedback/records")
+def admin_ai_feedback_records(
+    db: DBSession,
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=200),
+) -> dict:
+    return exam_feedback_service.list_admin_feedback_records(db, page=page, size=size)
 
 
 # ---- 全站调用日志 ----
@@ -233,9 +264,7 @@ def admin_list_logs(
 ) -> dict:
     base = select(CallLog)
     if class_id:
-        student_ids = db.scalars(
-            select(User.id).where(User.role == "student", User.class_id == class_id)
-        ).all()
+        student_ids = get_class_student_user_ids(db, [class_id])
         if not student_ids:
             return {"total": 0, "page": page, "size": size, "items": []}
         base = base.where(CallLog.user_id.in_(student_ids))
@@ -268,3 +297,115 @@ def admin_list_logs(
             for r in rows
         ],
     }
+
+
+# ---- 智能体管理 ----
+
+class AdminAgentIn(BaseModel):
+    name: str
+    intro: str = ""
+    endpoint: str = "/api/agents/course/ask"
+    course_id: int | None = None
+    slug: str
+    status: str = "planned"
+    owner_id: int | None = None
+    is_shared: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("名称不能为空")
+        return v
+
+    @field_validator("slug")
+    @classmethod
+    def slug_format(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not v:
+            raise ValueError("请选择编程语言（slug 不能为空）")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", v):
+            raise ValueError("slug 仅允许小写字母、数字与连字符")
+        return v
+
+    @field_validator("status")
+    @classmethod
+    def status_valid(cls, v: str) -> str:
+        if v not in ("active", "planned"):
+            raise ValueError("status 须为 active 或 planned")
+        return v
+
+
+def _assert_agent_course(db: DBSession, course_id: int | None) -> None:
+    if course_id is not None and not db.get(Course, course_id):
+        raise HTTPException(404, "绑定课程不存在")
+
+
+def _assert_slug_unique(db: DBSession, slug: str, owner_id: int | None, exclude_id: int | None = None) -> None:
+    if not slug:
+        return
+    q = select(Agent).where(Agent.slug == slug)
+    if owner_id is not None:
+        q = q.where(Agent.owner_id == owner_id)
+    if exclude_id:
+        q = q.where(Agent.id != exclude_id)
+    if db.scalar(q):
+        raise HTTPException(400, f"slug「{slug}」已存在")
+
+
+@router.get("/agents")
+def list_agents_admin(db: DBSession) -> list[dict]:
+    rows = db.scalars(select(Agent).order_by(Agent.id)).all()
+    return [_agent_dict(a, db) for a in rows]
+
+
+@router.post("/agents", status_code=201)
+def create_agent_admin(payload: AdminAgentIn, db: DBSession) -> dict:
+    _assert_agent_course(db, payload.course_id)
+    _assert_slug_unique(db, payload.slug, payload.owner_id)
+    agent = Agent(
+        name=payload.name,
+        intro=payload.intro,
+        endpoint=payload.endpoint or "/api/agents/course/ask",
+        course_id=payload.course_id,
+        slug=payload.slug,
+        status=payload.status,
+        owner_id=payload.owner_id,
+        is_shared=payload.is_shared,
+    )
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+    return _agent_dict(agent, db)
+
+
+@router.put("/agents/{agent_id}")
+def update_agent_admin(agent_id: int, payload: AdminAgentIn, db: DBSession) -> dict:
+    agent = db.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(404, "智能体不存在")
+    _assert_agent_course(db, payload.course_id)
+    _assert_slug_unique(db, payload.slug, payload.owner_id if payload.owner_id is not None else agent.owner_id, exclude_id=agent_id)
+    agent.name = payload.name
+    agent.intro = payload.intro
+    agent.endpoint = payload.endpoint or "/api/agents/course/ask"
+    agent.course_id = payload.course_id
+    agent.slug = payload.slug
+    agent.status = payload.status
+    if payload.owner_id is not None:
+        agent.owner_id = payload.owner_id
+    agent.is_shared = payload.is_shared
+    db.commit()
+    db.refresh(agent)
+    return _agent_dict(agent, db)
+
+
+@router.delete("/agents/{agent_id}")
+def delete_agent_admin(agent_id: int, db: DBSession) -> dict:
+    agent = db.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(404, "智能体不存在")
+    db.delete(agent)
+    db.commit()
+    return {"ok": True}

@@ -10,6 +10,7 @@ html, body, #app {
 * { box-sizing: border-box; }
 
 .app-layout { height: 100vh; }
+.app-layout > .el-container { flex: 1; min-width: 0; }
 .app-aside { background: #001529; color: #fff; }
 .app-header { background: #fff; border-bottom: 1px solid #eaecef; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; }
 .app-main { padding: 16px; }

@@ -17,9 +17,23 @@ from ..deps import (
     require_role,
     resolve_resource_class_ids,
 )
-from ..models import Chapter, Material
+from ..models import Agent, Chapter, Course, Material
 from ..services import indexer, vector_store
-from ..services.chapter_splitter import detect_chapters_in_pdf, split_pdf_by_chapters
+from ..services.agent_access import (
+    assert_teacher_can_manage_agent_content,
+    apply_agent_content_scope,
+    get_teacher_agent_bound_classes,
+    resolve_resource_class_ids_for_agent,
+)
+from ..services.chapter_splitter import detect_chapters_in_pdf, split_pdf_by_chapters, build_chapter_plan_from_courseware, extract_pdf_pages_with_corners
+from ..services.chapter_sync import (
+    resolve_chapters_for_textbook,
+    C_LANG_COURSE_ID,
+    assert_teacher_can_manage_course,
+    create_custom_chapters,
+    requires_agent_scoped_chapters,
+    uses_course_level_preset_chapters,
+)
 from ..services.indexer import index_material, index_pdf_pages, _build_page_offset_map
 
 router = APIRouter(prefix="/materials", tags=["materials"])
@@ -50,15 +64,41 @@ def list_materials(
     db: DBSession,
     chapter_id: int | None = None,
     class_id: int | None = Query(default=None),
+    course_id: int | None = Query(default=None),
+    agent_id: int | None = Query(default=None),
 ) -> list[dict]:
-    allowed_classes = resolve_resource_class_ids(db, user, class_id)
+    agent = db.get(Agent, agent_id) if agent_id else None
+    if agent and user.role == "teacher" and agent.owner_id == user.id:
+        from ..services.agent_adopt import dedupe_agent_content, repair_adopted_chapter_links
+
+        changed = bool(repair_adopted_chapter_links(db, agent))
+        if dedupe_agent_content(db, agent):
+            changed = True
+        if changed:
+            db.commit()
+            db.refresh(agent)
+
+    allowed_classes = resolve_resource_class_ids_for_agent(
+        db, user, class_id, agent_id=agent_id,
+    )
     q = select(Material).order_by(Material.id.desc())
     if chapter_id:
         q = q.where(Material.chapter_id == chapter_id)
-    if allowed_classes is not None:
-        if not allowed_classes:
+    if course_id is not None:
+        ch_q = select(Chapter.id).where(Chapter.course_id == course_id)
+        if uses_course_level_preset_chapters(db, course_id, agent_id):
+            ch_q = ch_q.where(Chapter.agent_id.is_(None))
+        elif requires_agent_scoped_chapters(db, course_id, agent_id):
+            if agent_id is None:
+                return []
+            ch_q = ch_q.where(Chapter.agent_id == agent_id)
+        chapter_ids = db.scalars(ch_q).all()
+        if not chapter_ids:
             return []
-        q = q.where(Material.class_id.in_(allowed_classes))
+        q = q.where(Material.chapter_id.in_(chapter_ids))
+    q = apply_agent_content_scope(Material, q, agent, allowed_classes, db=db)
+    if q is None:
+        return []
     rows = db.scalars(q).all()
     return [
         {
@@ -71,6 +111,23 @@ def list_materials(
     ]
 
 
+def _resolve_upload_agent_id(
+    db: DBSession,
+    user: CurrentUser,
+    agent_id: int | None,
+    class_ids: list[int] | None = None,
+) -> int | None:
+    if agent_id is None:
+        return None
+    agent = assert_teacher_can_manage_agent_content(db, user, agent_id)
+    if user.role == "teacher" and agent.owner_id != user.id and class_ids:
+        allowed = set(get_teacher_agent_bound_classes(db, user, agent_id))
+        for cid in class_ids:
+            if cid not in allowed:
+                raise HTTPException(403, "该班级未绑定当前智能体")
+    return agent_id
+
+
 @router.post("/upload", dependencies=[Depends(require_role("teacher", "admin"))])
 def upload(
     user: CurrentUser,
@@ -79,6 +136,7 @@ def upload(
     class_ids: list[int] = Form(...),
     title: str = Form(...),
     file: UploadFile = File(...),
+    agent_id: int | None = Form(default=None),
 ) -> dict:
     if not db.get(Chapter, chapter_id):
         raise HTTPException(404, "章节不存在")
@@ -88,6 +146,7 @@ def upload(
     for cid in unique_class_ids:
         assert_teacher_upload_class(db, user, cid)
 
+    resolved_agent_id = _resolve_upload_agent_id(db, user, agent_id, unique_class_ids)
     path = _save_upload(file)
     ext = Path(file.filename or "").suffix.lower()
     material_ids: list[int] = []
@@ -97,7 +156,7 @@ def upload(
     for cid in unique_class_ids:
         material = Material(
             chapter_id=chapter_id, class_id=cid, type=EXT_TO_TYPE[ext],
-            title=title, file_path=path,
+            title=title, file_path=path, agent_id=resolved_agent_id,
         )
         db.add(material)
         db.flush()
@@ -130,35 +189,60 @@ def upload(
 def upload_textbook(
     user: CurrentUser,
     db: DBSession,
+    course_id: int = Form(...),
     class_ids: list[int] = Form(...),
     file: UploadFile = File(...),
     title_prefix: str = Form(""),
+    agent_id: int | None = Form(default=None),
+    toc_page_start: int | None = Form(default=None),
+    toc_page_end: int | None = Form(default=None),
 ) -> dict:
-    """整本教材 PDF 上传：自动按章节拆分，每章创建独立 Material 并索引对应页面。"""
+    """整本教材 PDF 上传：按课程拆分章节。无预置章节的课程（如 Java）会从 PDF 自动创建章节。"""
+    if not db.get(Course, course_id):
+        raise HTTPException(404, "课程不存在")
     unique_class_ids = list(dict.fromkeys(class_ids))
     if not unique_class_ids:
         raise HTTPException(400, "请至少选择一个班级")
     for cid in unique_class_ids:
         assert_teacher_upload_class(db, user, cid)
+    resolved_agent_id = _resolve_upload_agent_id(db, user, agent_id, unique_class_ids)
     ext = Path(file.filename or "").suffix.lower()
     if ext != ".pdf":
         raise HTTPException(400, "整本教材上传仅支持 PDF")
+
+    if toc_page_start is not None and toc_page_start < 1:
+        raise HTTPException(400, "目录起始页须 ≥ 1（PDF 阅读器页码）")
+    if toc_page_end is not None and toc_page_end < 1:
+        raise HTTPException(400, "目录结束页须 ≥ 1（PDF 阅读器页码）")
+    if (
+        toc_page_start is not None
+        and toc_page_end is not None
+        and toc_page_end < toc_page_start
+    ):
+        raise HTTPException(400, "目录结束页不能小于起始页")
+
     path = _save_upload(file)
 
-    import pdfplumber
-    with pdfplumber.open(path) as pdf:
-        pages_text = [p.extract_text() or "" for p in pdf.pages]
+    pages_text, page_corners = extract_pdf_pages_with_corners(path)
 
-    # 从 DB 取章节列表
-    chapters = db.scalars(select(Chapter).order_by(Chapter.order_idx)).all()
-    chapter_dicts = [{"id": c.id, "title": c.title, "order_idx": c.order_idx} for c in chapters]
+    chapter_dicts, chapters_created = resolve_chapters_for_textbook(
+        db,
+        course_id,
+        pages_text,
+        agent_id=resolved_agent_id,
+        page_corners=page_corners,
+        toc_page_start=toc_page_start,
+        toc_page_end=toc_page_end,
+    )
 
-    # 切分
-    splits = split_pdf_by_chapters(pages_text, chapter_dicts)
+    splits = split_pdf_by_chapters(
+        pages_text, chapter_dicts,
+        dynamic_course=requires_agent_scoped_chapters(db, course_id, resolved_agent_id),
+        page_corners=page_corners,
+    )
     if not splits:
         raise HTTPException(400, "未能识别 PDF 中的章节标题，请确认 PDF 包含「第N章」格式的章节标题。")
 
-    # 构建印刷页码映射
     offset_map = _build_page_offset_map(pages_text, splits)
 
     prefix = title_prefix or Path(file.filename).stem
@@ -172,6 +256,7 @@ def upload_textbook(
                 type="pdf",
                 title=f"{prefix} - {sp['chapter_title']}",
                 file_path=path,
+                agent_id=resolved_agent_id,
                 meta_json={"page_start": sp["start_page"], "page_end": sp["end_page"]},
             )
             db.add(material); db.flush()
@@ -187,12 +272,141 @@ def upload_textbook(
                 "material_id": material.id,
                 "chunks": chunks,
             })
+
+    from ..services.agent_service import maybe_activate_course_agent
+    maybe_activate_course_agent(db, course_id)
     db.commit()
 
     return {
         "ok": True,
+        "course_id": course_id,
+        "chapters_created": chapters_created,
         "total_pages": len(pages_text),
         "chapters_split": len(splits),
+        "class_count": len(unique_class_ids),
+        "total_chunks": total_chunks,
+        "details": results,
+    }
+
+
+@router.post("/upload-courseware-batch", dependencies=[Depends(require_role("teacher", "admin"))])
+def upload_courseware_batch(
+    user: CurrentUser,
+    db: DBSession,
+    course_id: int = Form(...),
+    class_ids: list[int] = Form(...),
+    files: list[UploadFile] = File(...),
+    agent_id: int | None = Form(default=None),
+) -> dict:
+    """批量上传各章课件：从文件名/PDF 首页识别章节并创建结构，同时索引资料。"""
+    if not db.get(Course, course_id):
+        raise HTTPException(404, "课程不存在")
+    unique_class_ids = list(dict.fromkeys(class_ids))
+    if not unique_class_ids:
+        raise HTTPException(400, "请至少选择一个班级")
+    for cid in unique_class_ids:
+        assert_teacher_upload_class(db, user, cid)
+
+    resolved_agent_id = _resolve_upload_agent_id(db, user, agent_id, unique_class_ids)
+    if uses_course_level_preset_chapters(db, course_id, resolved_agent_id):
+        raise HTTPException(400, "C 语言原智能体使用预置章节，请使用单章上传")
+    assert_teacher_can_manage_course(db, user, course_id)
+
+    if not files:
+        raise HTTPException(400, "请至少选择一个课件文件")
+    if len(files) > 50:
+        raise HTTPException(400, "单次最多上传 50 个课件")
+
+    existing = db.scalars(
+        select(Chapter.id).where(
+            Chapter.course_id == course_id,
+            Chapter.agent_id == resolved_agent_id,
+        ).limit(1)
+    ).first()
+    if existing:
+        raise HTTPException(400, "该智能体下已有章节，请使用「单章上传」补充资料")
+
+    filenames = [f.filename or f"file{i}" for i, f in enumerate(files)]
+
+    saved_paths: list[str] = []
+    file_paths: dict[int, str] = {}
+    try:
+        for i, uf in enumerate(files):
+            path = _save_upload(uf)
+            saved_paths.append(path)
+            file_paths[i] = path
+
+        try:
+            plan = build_chapter_plan_from_courseware(filenames, file_paths=file_paths)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
+        chapter_rows = create_custom_chapters(
+            db,
+            course_id,
+            [{"order_idx": p["order_idx"], "title": p["title"], "description": p.get("description") or ""} for p in plan],
+            agent_id=resolved_agent_id,
+            commit=False,
+        )
+        order_to_id = {c["order_idx"]: c["id"] for c in chapter_rows}
+
+        results = []
+        total_chunks = 0
+        for item in plan:
+            file_idx = item["file_index"]
+            path = saved_paths[file_idx]
+            uf = files[file_idx]
+            ext = Path(uf.filename or "").suffix.lower()
+            if ext not in EXT_TO_TYPE:
+                raise HTTPException(400, f"不支持的文件类型: {ext}")
+            chapter_id = order_to_id[item["order_idx"]]
+            title = item["title"]
+            file_chunks = 0
+            material_ids: list[int] = []
+            for cid in unique_class_ids:
+                material = Material(
+                    chapter_id=chapter_id,
+                    class_id=cid,
+                    type=EXT_TO_TYPE[ext],
+                    title=title,
+                    file_path=path,
+                    agent_id=resolved_agent_id,
+                )
+                db.add(material)
+                db.flush()
+                try:
+                    chunks = index_material(db, material)
+                except Exception as e:
+                    raise HTTPException(500, f"索引失败（{uf.filename}）: {e}") from e
+                file_chunks += chunks
+                material_ids.append(material.id)
+            total_chunks += file_chunks
+            results.append({
+                "chapter_id": chapter_id,
+                "chapter_title": item["title"],
+                "file_name": uf.filename,
+                "parse_source": item["parse_source"],
+                "material_ids": material_ids,
+                "chunks": file_chunks,
+            })
+
+        from ..services.agent_service import maybe_activate_course_agent
+        maybe_activate_course_agent(db, course_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        for path in saved_paths:
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except OSError:
+                pass
+        raise
+
+    return {
+        "ok": True,
+        "course_id": course_id,
+        "chapters_created": len(chapter_rows),
         "class_count": len(unique_class_ids),
         "total_chunks": total_chunks,
         "details": results,
@@ -224,6 +438,13 @@ def delete_material(material_id: int, user: CurrentUser, db: DBSession) -> dict:
 def reindex(user: CurrentUser, db: DBSession) -> dict:
     allowed = resolve_resource_class_ids(db, user)
     return indexer.reindex_all(db, class_ids=allowed)
+
+
+@router.post("/reindex-videos", dependencies=[Depends(require_role("teacher", "admin"))])
+def reindex_videos_api(user: CurrentUser, db: DBSession) -> dict:
+    """仅重建视频（换 Whisper 模型后用；不动 PDF）。"""
+    allowed = resolve_resource_class_ids(db, user)
+    return indexer.reindex_videos(db, class_ids=allowed)
 
 
 @router.post("/re-split-textbook", dependencies=[Depends(require_role("teacher", "admin"))])
@@ -270,24 +491,34 @@ def re_split_textbook(user: CurrentUser, db: DBSession) -> dict:
             db.delete(m)
     db.flush()
 
-    # 3. 用新拆分逻辑重新创建资料并索引
-    chapters = db.scalars(select(Chapter).order_by(Chapter.order_idx)).all()
-    chapter_dicts = [{"id": c.id, "title": c.title, "order_idx": c.order_idx} for c in chapters]
-
+    # 3. 用新拆分逻辑重新创建资料并索引（按教材所属课程过滤章节）
     total_created = 0
     total_chunks = 0
     results = []
 
     for fp, orig_materials in textbook_file_paths:
         try:
-            import pdfplumber
-            with pdfplumber.open(fp) as pdf:
-                pages_text = [p.extract_text() or "" for p in pdf.pages]
+            pages_text, page_corners = extract_pdf_pages_with_corners(fp)
         except Exception as e:
             results.append({"error": f"读取PDF失败: {e}"})
             continue
 
-        splits = split_pdf_by_chapters(pages_text, chapter_dicts)
+        sample_ch = db.get(Chapter, orig_materials[0].chapter_id) if orig_materials else None
+        course_id = sample_ch.course_id if sample_ch else None
+        if not course_id:
+            results.append({"error": "无法确定教材所属课程"})
+            continue
+
+        chapters = db.scalars(
+            select(Chapter).where(Chapter.course_id == course_id).order_by(Chapter.order_idx)
+        ).all()
+        chapter_dicts = [{"id": c.id, "title": c.title, "order_idx": c.order_idx} for c in chapters]
+
+        splits = split_pdf_by_chapters(
+            pages_text, chapter_dicts,
+            dynamic_course=requires_agent_scoped_chapters(db, course_id, None),
+            page_corners=page_corners,
+        )
         if not splits:
             results.append({"error": "未能识别章节标题"})
             continue

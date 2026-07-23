@@ -1,5 +1,13 @@
 import axios, { type AxiosInstance } from 'axios'
 import { ElMessage } from 'element-plus'
+import { useAuthStore } from '@/stores/auth'
+
+declare module 'axios' {
+  interface AxiosRequestConfig {
+    /** 为 true 时不弹出全局错误 toast（由调用方自行处理） */
+    skipGlobalError?: boolean
+  }
+}
 
 const http: AxiosInstance = axios.create({
   baseURL: '/api',
@@ -17,15 +25,28 @@ http.interceptors.response.use(
   (err) => {
     let msg = err?.response?.data?.detail || err.message || '请求失败'
     if (err?.code === 'ECONNABORTED' || /timeout/i.test(err?.message || '')) {
-      msg = '请求超时：后端可能正在重启或未启动，请稍候再试或运行 backend\\dev.bat'
+      msg = '请求超时：教材拆分与索引耗时较长，请稍候再试；若后端正在重启请运行 backend\\dev.bat'
     } else if (!err?.response) {
       msg = '无法连接后端服务，请确认 backend 已在 8000 端口运行'
     }
     if (err?.response?.status === 401) {
-      localStorage.removeItem('token')
-      if (location.pathname !== '/login') location.href = '/login'
+      try {
+        useAuthStore().logout()
+      } catch {
+        localStorage.removeItem('token')
+      }
+      const path = window.location.pathname
+      if (path !== '/login' && path !== '/register' && path !== '/welcome') {
+        import('@/router').then(({ default: router }) => {
+          if (router.currentRoute.value.path !== '/welcome') {
+            router.replace('/welcome')
+          }
+        })
+      }
     }
-    ElMessage.error(msg)
+    if (!err?.config?.skipGlobalError) {
+      ElMessage.error(msg)
+    }
     return Promise.reject(err)
   },
 )

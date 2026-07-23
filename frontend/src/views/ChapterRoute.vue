@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
+import { onMounted, ref, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import http from '@/api'
 import { useAuthStore } from '@/stores/auth'
 import { useCourseAgentStore } from '@/stores/courseAgent'
+import { useAgentBoundClasses } from '@/composables/useAgentBoundClasses'
+import { useAgentCourseScope } from '@/composables/useAgentCourseScope'
 
 interface Chapter { id: number; title: string; order_idx: number; description: string }
 interface Progress { chapter_id: number; status: string; last_exam_id: number | null }
@@ -13,7 +15,12 @@ interface HistoryRow {
   status: string; total_score: number | null
   started_at: string | null; submitted_at: string | null
 }
-interface MyClassInfo { class_id: number | null; class_name?: string; name?: string }
+interface Enrollment {
+  class_id: number
+  class_name: string
+  course_id: number
+  course_name: string
+}
 interface ClassItem { id: number; name: string }
 interface AttemptInfo {
   used: number; max: number; remaining: number; configured: boolean
@@ -26,12 +33,16 @@ interface ChapterProgressStat {
 const router = useRouter()
 const userStore = useAuthStore()
 const agentStore = useCourseAgentStore()
+const { loadScopedClasses, pickClassId } = useAgentBoundClasses()
+const { chapterListParams } = useAgentCourseScope()
+const needsAgentGuide = computed(() => !agentStore.current)
+const agentPlanned = computed(() => agentStore.current && !agentStore.isActive())
 const chapters = ref<Chapter[]>([])
 const progress = ref<Record<number, Progress>>({})
 const loading = ref(false)
 const history = ref<HistoryRow[]>([])
 const attempts = ref<Record<number, AttemptInfo>>({})
-const myClass = ref<MyClassInfo | null>(null)
+const myEnrollments = ref<Enrollment[]>([])
 const classes = ref<ClassItem[]>([])
 const selectedClassId = ref<number | undefined>(undefined)
 const classProgress = ref<ChapterProgressStat[]>([])
@@ -39,15 +50,26 @@ const classOverview = ref<{ class_name: string; student_count: number } | null>(
 
 const isStudent = computed(() => userStore.user?.role === 'student')
 const isTeacher = computed(() => userStore.user?.role === 'teacher' || userStore.user?.role === 'admin')
+const noChapters = computed(() => !loading.value && chapters.value.length === 0)
 
+const studentClassId = computed(() => {
+  const courseId = agentStore.current?.course_id
+  if (!courseId) return undefined
+  const e = myEnrollments.value.find(x => x.course_id === courseId)
+  return e?.class_id
+})
 const classLabel = computed(() => {
-  if (isStudent.value) return myClass.value?.class_name || myClass.value?.name || ''
+  if (isStudent.value) {
+    const cid = studentClassId.value
+    const e = myEnrollments.value.find(x => x.class_id === cid)
+    return e ? `${e.class_name}（${e.course_name}）` : ''
+  }
   const c = classes.value.find(x => x.id === selectedClassId.value)
   return c?.name || ''
 })
 const hasClass = computed(() => {
   if (isTeacher.value) return !!selectedClassId.value
-  return !!myClass.value?.class_id
+  return !!studentClassId.value
 })
 
 const progressMap = computed(() =>
@@ -90,10 +112,14 @@ const submittedCountByChapter = computed(() => {
 })
 
 function attemptsParams() {
+  const p: Record<string, number> = {}
   if (isTeacher.value && selectedClassId.value) {
-    return { class_id: selectedClassId.value }
+    p.class_id = selectedClassId.value
+  } else if (isStudent.value && studentClassId.value) {
+    p.class_id = studentClassId.value
   }
-  return {}
+  if (agentStore.current?.id) p.agent_id = agentStore.current.id
+  return p
 }
 
 async function loadAttempts(chapterList: Chapter[]) {
@@ -115,7 +141,11 @@ async function loadClassProgress() {
     return
   }
   const { data } = await http.get('/exams/teacher/class-progress', {
-    params: { class_id: selectedClassId.value },
+    params: {
+      class_id: selectedClassId.value,
+      course_id: agentStore.current?.course_id || undefined,
+      agent_id: agentStore.current?.id || undefined,
+    },
   })
   classProgress.value = data.chapters || []
   classOverview.value = {
@@ -125,29 +155,34 @@ async function loadClassProgress() {
 }
 
 async function load() {
+  await agentStore.restoreAgent()
   loading.value = true
   try {
     if (isStudent.value) {
       try {
-        const { data } = await http.get<MyClassInfo>('/classes/my')
-        myClass.value = data
+        const { data } = await http.get<Enrollment[]>('/classes/my')
+        myEnrollments.value = data
       } catch {
-        myClass.value = null
+        myEnrollments.value = []
       }
     } else if (isTeacher.value) {
-      const { data } = await http.get<ClassItem[]>('/classes/mine')
+      const data = await loadScopedClasses()
       classes.value = data
-      if (data.length && !selectedClassId.value) {
-        selectedClassId.value = data[0].id
-      }
+      selectedClassId.value = pickClassId(data, selectedClassId.value)
     }
 
-    const chapterParams: Record<string, number> = {}
-    if (agentStore.current?.course_id) chapterParams.course_id = agentStore.current.course_id
+    const chapterParams = chapterListParams()
+    const progressParams = chapterListParams()
+    const historyParams: Record<string, number> = {}
+    if (agentStore.current?.course_id) {
+      historyParams.course_id = agentStore.current.course_id
+    }
     const [ch, pr, hist] = await Promise.all([
       http.get<Chapter[]>('/chapters', { params: chapterParams }),
-      isStudent.value ? http.get<Progress[]>('/chapters/progress/all') : Promise.resolve({ data: [] }),
-      http.get('/exams/history/mine'),
+      isStudent.value
+        ? http.get<Progress[]>('/chapters/progress/all', { params: progressParams })
+        : Promise.resolve({ data: [] }),
+      http.get('/exams/history/mine', { params: historyParams }),
     ])
     chapters.value = ch.data
     progress.value = Object.fromEntries(pr.data.map((p) => [p.chapter_id, p]))
@@ -155,7 +190,7 @@ async function load() {
 
     if (isTeacher.value && selectedClassId.value) {
       await Promise.all([loadClassProgress(), loadAttempts(ch.data)])
-    } else if (isStudent.value && myClass.value?.class_id) {
+    } else if (isStudent.value && studentClassId.value) {
       await loadAttempts(ch.data)
     }
   } finally {
@@ -216,8 +251,13 @@ async function startExam(ch: Chapter) {
       '提示',
       { type: 'warning' }
     )
-    const payload: { chapter_id: number; class_id?: number } = { chapter_id: ch.id }
-    if (isTeacher.value && selectedClassId.value) payload.class_id = selectedClassId.value
+    const payload: { chapter_id: number; class_id?: number; agent_id?: number } = { chapter_id: ch.id }
+    if (isTeacher.value && selectedClassId.value) {
+      payload.class_id = selectedClassId.value
+    } else if (isStudent.value && studentClassId.value) {
+      payload.class_id = studentClassId.value
+    }
+    if (agentStore.current?.id) payload.agent_id = agentStore.current.id
     const { data } = await http.post('/exams/start', payload, { timeout: 120000 })
     if (data.warnings?.length) ElMessage.warning(data.warnings.join('; '))
     ElMessage.success('试卷已生成')
@@ -255,6 +295,13 @@ async function onClassChange() {
   }
 }
 
+watch(
+  () => agentStore.current?.id,
+  (id, prev) => {
+    if (id && id !== prev) load()
+  },
+)
+
 onMounted(load)
 </script>
 
@@ -277,6 +324,29 @@ onMounted(load)
         </div>
       </div>
     </template>
+
+    <el-alert
+      v-if="needsAgentGuide"
+      type="warning"
+      :closable="false"
+      title="尚未选择课程"
+      style="margin-bottom: 12px"
+    >
+      <template #default>
+        请先从
+        <el-link type="primary" @click="router.push('/agents')">课程智能体</el-link>
+        选择一门课程，或从课程首页进入本页。
+      </template>
+    </el-alert>
+
+    <el-alert
+      v-if="agentPlanned"
+      type="info"
+      :closable="false"
+      :title="`${agentStore.current?.name} 尚未上线`"
+      description="该课程正在筹备中，章节考核功能暂不可用。"
+      style="margin-bottom: 12px"
+    />
 
     <el-alert
       v-if="isStudent && !hasClass"
@@ -305,7 +375,24 @@ onMounted(load)
       style="margin-bottom: 12px"
     />
 
-    <el-timeline>
+    <el-alert
+      v-if="noChapters && !needsAgentGuide"
+      type="warning"
+      :closable="false"
+      title="尚未生成章节"
+      style="margin-bottom: 12px"
+    >
+      <template #default>
+        <span v-if="isTeacher">
+          本课程章节需先建立结构。请在
+          <el-link type="primary" @click="router.push('/teacher/materials')">资料管理</el-link>
+          中批量上传各章课件自动识别章节，或上传整本教材 PDF，或自定义章节结构后按章上传资料。
+        </span>
+        <span v-else>教师上传教材并生成章节后，此处将显示章节学习路线与考核入口。</span>
+      </template>
+    </el-alert>
+
+    <el-timeline v-if="chapters.length">
       <el-timeline-item
         v-for="ch in chapters"
         :key="ch.id"
@@ -387,7 +474,12 @@ onMounted(load)
       </el-timeline-item>
     </el-timeline>
 
-    <template v-if="isTeacher && classProgress.length">
+    <el-empty
+      v-else-if="noChapters && !needsAgentGuide"
+      description="暂无章节，请先在「资料管理」中上传课件、整本教材或自定义章节结构"
+    />
+
+    <template v-if="chapters.length && isTeacher && classProgress.length">
       <el-divider>班级各章完成率汇总</el-divider>
       <el-table :data="classProgress" size="small" border>
         <el-table-column label="章节" prop="chapter_title" />
