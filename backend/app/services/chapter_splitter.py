@@ -269,13 +269,40 @@ def split_pdf_by_chapters(
     def skip_toc_page(text: str) -> bool:
         return _is_toc_page_for_extraction(text) if dynamic_course else _is_toc_page(text)
 
-    # 构造 order_idx -> title_text 映射（用于标题文本匹配）
+    # 构造标题 → order 映射；短标题（如「数组」）仅允许整行标题匹配，避免正文误命中
     title_to_order: dict[str, int] = {}
+    short_title_to_order: dict[str, int] = {}
     for c in chapters_sorted:
         title_text = _extract_title_text(c["title"])
-        # 只对长度>=3的标题文本做匹配，避免"数组"等短词误判
+        if not title_text:
+            continue
         if len(title_text) >= 3:
             title_to_order[title_text] = c["order_idx"]
+        elif len(title_text) >= 2:
+            short_title_to_order[title_text] = c["order_idx"]
+
+    def _normalize_heading_line(line: str) -> str:
+        s = (line or "").strip()
+        s = re.sub(r"^[「『\"'【\[]+", "", s)
+        s = re.sub(r"[」』\"'】\]\s]+$", "", s)
+        return s.strip()
+
+    def _match_short_title_heading(text: str) -> int | None:
+        """短章节名（2 字）仅当接近独立标题行时匹配，例如 OCR 成「数组」/「数组」」。"""
+        if not short_title_to_order:
+            return None
+        for raw in (text or "").splitlines()[:5]:
+            line = raw.strip()
+            if not line or len(line) > 12:
+                continue
+            cleaned = _normalize_heading_line(line)
+            order = short_title_to_order.get(cleaned)
+            if order is None:
+                continue
+            # 行本身几乎就是标题（允许少量 OCR 标点）
+            if len(_normalize_heading_line(line)) == len(cleaned) and len(line) <= len(cleaned) + 2:
+                return order
+        return None
 
     # 第一遍：为每个非目录页检测所属章节
     HEADER_LEN = 80
@@ -323,10 +350,20 @@ def split_pdf_by_chapters(
                     continue
 
             # 2) 匹配章节标题文本（如 "数据类型与输入输出"）——仅限页眉区域
-            for title_text, order in title_to_order.items():
+            matched = False
+            for title_text, order in sorted(title_to_order.items(), key=lambda x: -len(x[0])):
                 if title_text in head:
                     page_chapter[i] = order
+                    matched = True
                     break
+            if matched:
+                continue
+
+            # 3) 短标题独立行（「数组」被 OCR 丢了「第9章」时的常见情形）
+            short_order = _match_short_title_heading(text)
+            if short_order is not None:
+                page_chapter[i] = short_order
+                continue
 
     # 第二遍：carry-forward 填充无检测的页面
     # 单调推进：一旦进入第N章，不再回退到更早的章节（避免正文交叉引用"见第1章"误判）

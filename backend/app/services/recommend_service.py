@@ -436,17 +436,14 @@ def extract_attachment_keywords(text: str, limit: int = 18) -> list[str]:
     return found[:limit]
 
 
-def recommend_from_attachment(
-    db: Session,
+def collect_attachment_hits(
     attachments: list,
     class_ids: list[int] | None = None,
     chapter_id: int | None = None,
     course_id: int | None = None,
-    max_items: int = 12,
     agent_id: int | None = None,
-    question: str = "",
 ) -> list[dict]:
-    """根据附件考点关键词，在资料管理已索引的资源中检索并推荐具体页码/视频时间点。"""
+    """仅做 Chroma 关键词命中（无线程不安全的 DB Session），供 asyncio.to_thread 调用。"""
     from .rag_service import _keyword_search
 
     texts = [getattr(a, "text", "") or a.get("text", "") for a in attachments]
@@ -473,9 +470,34 @@ def recommend_from_attachment(
             h["keyword"] = kw
             h["distance"] = 0.0
             all_hits.append(h)
+    return all_hits
+
+
+def recommend_from_attachment(
+    db: Session,
+    attachments: list,
+    class_ids: list[int] | None = None,
+    chapter_id: int | None = None,
+    course_id: int | None = None,
+    max_items: int = 12,
+    agent_id: int | None = None,
+    question: str = "",
+) -> list[dict]:
+    """根据附件考点关键词，在资料管理已索引的资源中检索并推荐具体页码/视频时间点。"""
+    all_hits = collect_attachment_hits(
+        attachments,
+        class_ids=class_ids,
+        chapter_id=chapter_id,
+        course_id=course_id,
+        agent_id=agent_id,
+    )
+    if not all_hits:
+        return []
 
     recs = recommend_from_hits(db, all_hits, max_items=max_items)
-    search_q = question or " ".join(keywords[:6])
+    search_q = question or " ".join(
+        sorted({(h.get("keyword") or "") for h in all_hits if h.get("keyword")})[:6]
+    )
     recs = ensure_video_recommendations(
         db, recs, search_q,
         chapter_id=chapter_id, class_ids=class_ids,

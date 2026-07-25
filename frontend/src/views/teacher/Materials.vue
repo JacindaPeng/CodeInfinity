@@ -343,6 +343,7 @@ async function submitTextbookUpload() {
     const classHint = data.class_count > 1 ? `，已同步到 ${data.class_count} 个班级` : ''
     const createdHint = data.chapters_created ? '，已从教材分析生成章节' : ''
     ElMessage.success(`整本教材已拆分：${data.chapters_split} 章，共 ${data.total_chunks} 个片段${classHint}${createdHint}`)
+    if (data.warning) ElMessage.warning(data.warning)
     await loadChapters()
     if (data.chapters_created && agentStore.current?.course_id === selectedCourseId.value) {
       const { data: agent } = await http.get(`/agents/${agentStore.current.id}`)
@@ -372,6 +373,7 @@ async function submitCoursewareBatch() {
     coursewareResult.value = data
     const classHint = data.class_count > 1 ? `，已同步到 ${data.class_count} 个班级` : ''
     ElMessage.success(`已识别 ${data.chapters_created} 个章节并索引 ${data.total_chunks} 个片段${classHint}`)
+    if (data.warning) ElMessage.warning(data.warning)
     await loadChapters()
     if (agentStore.current?.course_id === selectedCourseId.value) {
       const { data: agent } = await http.get(`/agents/${agentStore.current.id}`)
@@ -677,7 +679,7 @@ watch(
             :closable="false"
             style="margin-bottom: 12px"
             title="批量上传各章课件，自动识别章节"
-            description="一次选择多份课件（PDF/PPT/Word），系统按文件名或课件首页标题识别「第N章 / 第七章」等并创建章节、索引资料。命名示例：第1章 绪论.pptx、第七章 Qt对象模型.pptx；无法识别时按文件名排序依次编号。"
+            description="请先在「课程智能体 → 我的管理」中为本智能体绑定好班级。一次选择多份课件（PDF/PPT/Word），系统按文件名或课件首页标题识别「第N章」等并创建章节、索引资料。"
           />
           <el-form label-width="80px">
             <el-form-item label="班级">
@@ -691,6 +693,9 @@ watch(
               >
                 <el-option v-for="c in classes" :key="c.id" :label="c.name" :value="c.id" />
               </el-select>
+              <div style="margin-top: 6px; font-size: 12px; color: #909399; line-height: 1.4">
+                若无可选班级，请先绑定班级后再上传
+              </div>
             </el-form-item>
             <el-form-item label="课件">
               <el-upload

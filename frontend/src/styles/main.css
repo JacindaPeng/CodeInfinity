@@ -9,11 +9,43 @@ html, body, #app {
 
 * { box-sizing: border-box; }
 
-.app-layout { height: 100vh; }
-.app-layout > .el-container { flex: 1; min-width: 0; }
-.app-aside { background: #001529; color: #fff; }
-.app-header { background: #fff; border-bottom: 1px solid #eaecef; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; }
-.app-main { padding: 16px; }
-.menu-title { color: #fff; font-size: 16px; font-weight: 600; padding: 16px; text-align: center; border-bottom: 1px solid #1f2d3d; }
+.app-layout { height: 100vh; overflow: hidden; }
+.app-layout > .el-container {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.app-aside { background: #001529; color: #fff; overflow: auto; }
+.app-header {
+  background: #fff;
+  border-bottom: 1px solid #eaecef;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  height: 56px;
+  flex-shrink: 0;
+}
+.app-main {
+  padding: 16px 20px 24px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.app-main > * {
+  width: 100%;
+}
+.menu-title {
+  color: #fff;
+  font-size: 16px;
+  font-weight: 600;
+  padding: 16px;
+  text-align: center;
+  border-bottom: 1px solid #1f2d3d;
+}
 
 .chat-stream { white-space: pre-wrap; line-height: 1.7; }

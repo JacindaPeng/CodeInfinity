@@ -953,6 +953,40 @@ def run_all_migrations() -> None:
     backfill_resource_class_ids()
     migrate_knowledge_push()
     migrate_class_chat()
+    migrate_material_upload_paths()
+
+
+def migrate_material_upload_paths() -> None:
+    """把本机 Windows 绝对路径改写为当前 UPLOAD_DIR 下路径（Docker 可直接读文件）。"""
+    insp = inspect(engine)
+    if not insp.has_table("materials"):
+        return
+    from app.config import settings
+    from app.services.storage_paths import portable_upload_path, resolve_upload_path, stored_filename
+
+    upload_root = str(Path(settings.upload_dir).resolve())
+    fixed = 0
+    with SessionLocal() as db:
+        rows = db.scalars(select(Material)).all()
+        for m in rows:
+            stored = m.file_path or ""
+            if not stored:
+                continue
+            # 已在当前 upload_dir 下则跳过
+            norm = stored.replace("\\", "/")
+            if norm.startswith(upload_root.replace("\\", "/")) and resolve_upload_path(stored):
+                continue
+            resolved = resolve_upload_path(stored)
+            name = stored_filename(stored)
+            if resolved is None or not name:
+                continue
+            new_path = portable_upload_path(name)
+            if new_path != stored:
+                m.file_path = new_path
+                fixed += 1
+        if fixed:
+            db.commit()
+            print(f"[ok] materials.file_path 已迁移 {fixed} 条 → {upload_root}")
 
 
 def _ensure_extra_courses(db) -> None:

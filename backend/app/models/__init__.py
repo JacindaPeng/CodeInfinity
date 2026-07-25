@@ -171,7 +171,7 @@ class ExamConfig(Base):
     class_id: Mapped[int | None] = mapped_column(ForeignKey("teaching_classes.id"), nullable=True)
     agent_id: Mapped[int | None] = mapped_column(ForeignKey("agents.id"), nullable=True)
     config_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    # {"选择题": 2, "判断题": 2, "简答题": 2, "knowledge_points": ["AVL树", ...]}
+    # {"选择题": 2, "判断题": 2, "填空题": 1, "简答题": 2, "knowledge_points": ["AVL树", ...]}
     max_attempts: Mapped[int] = mapped_column(Integer, default=0)  # 0=无限次
 
     chapter: Mapped["Chapter"] = relationship(back_populates="exam_configs")

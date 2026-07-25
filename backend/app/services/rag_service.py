@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import AsyncGenerator
 
@@ -290,15 +291,16 @@ def _build_where(
     course_id: int | None = None,
     agent_id: int | None = None,
 ) -> dict | None:
-    """构建 Chroma where 过滤条件。"""
+    """构建 Chroma where：只使用 class_id / chapter_id。
+
+    Docker 下在 where 里加 course_id、agent_id 或 where_document.$contains
+    会导致数十秒级全表扫描；course_id / agent_id 改在 Python 侧过滤。
+    """
+    _ = (course_id, agent_id)  # 由 _meta_matches_scope 处理
     clauses: list[dict] = []
     if chapter_id is not None:
         clauses.append({"chapter_id": str(chapter_id)})
-    if course_id is not None:
-        clauses.append({"course_id": str(course_id)})
-    if agent_id is not None:
-        clauses.append({"agent_id": str(agent_id)})
-    elif class_ids is not None:
+    if class_ids is not None:
         if not class_ids:
             return {"class_id": "__none__"}
         if len(class_ids) == 1:
@@ -312,6 +314,95 @@ def _build_where(
     return {"$and": clauses}
 
 
+def _meta_matches_scope(
+    meta: dict | None,
+    *,
+    chapter_id: int | None = None,
+    class_ids: list[int] | None = None,
+    course_id: int | None = None,
+    agent_id: int | None = None,
+    enforce_chapter: bool = True,
+) -> bool:
+    """在内存中校验 chunk 是否属于当前检索范围。"""
+    meta = meta or {}
+    if enforce_chapter and chapter_id is not None:
+        if str(meta.get("chapter_id") or "") != str(chapter_id):
+            return False
+    if class_ids is not None:
+        try:
+            cid = int(meta.get("class_id"))
+        except (TypeError, ValueError):
+            return False
+        if cid not in class_ids:
+            return False
+    if course_id is not None:
+        mc = str(meta.get("course_id") or "")
+        # 旧索引常缺 course_id：缺省放行；有值则必须匹配
+        if mc and mc != str(course_id):
+            return False
+    if agent_id is not None:
+        if str(meta.get("agent_id") or "") != str(agent_id):
+            return False
+    return True
+
+
+def _usable_keywords(keywords: list[str], max_n: int = 8) -> list[str]:
+    """去掉运算符/过短噪声词，并按专指度截断，避免无效扫描。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for kw in sorted(keywords, key=_keyword_specificity, reverse=True):
+        if not kw or kw in seen:
+            continue
+        if re.fullmatch(r"[\W_]+", kw):
+            continue
+        if len(kw) < 2:
+            continue
+        seen.add(kw)
+        out.append(kw)
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def _is_toc_chunk(text: str) -> bool:
+    """检测是否为目录页（含大量点引导符）。"""
+    head = (text or "")[:300]
+    return head.count("…") + head.count("．．") + head.count("...") > 5
+
+
+def _fetch_scope_docs(
+    chapter_id: int | None,
+    class_ids: list[int] | None,
+    course_id: int | None = None,
+    agent_id: int | None = None,
+) -> list[tuple[str, dict, str]]:
+    """按班级/章节一次取出候选 chunk（不做 $contains）。"""
+    col = vector_store.get_collection()
+    where = _build_where(chapter_id, class_ids)
+    try:
+        res = col.get(where=where, limit=10000, include=["documents", "metadatas"])
+    except Exception:
+        return []
+    docs = res.get("documents") or []
+    metas = res.get("metadatas") or []
+    ids = res.get("ids") or []
+    out: list[tuple[str, dict, str]] = []
+    for doc, meta, id_ in zip(docs, metas, ids):
+        if not doc or _is_toc_chunk(doc):
+            continue
+        if not _meta_matches_scope(
+            meta,
+            chapter_id=chapter_id,
+            class_ids=class_ids,
+            course_id=course_id,
+            agent_id=agent_id,
+            enforce_chapter=chapter_id is not None,
+        ):
+            continue
+        out.append((doc, meta or {}, id_))
+    return out
+
+
 def _keyword_search(
     keywords: list[str],
     chapter_id: int | None = None,
@@ -320,74 +411,46 @@ def _keyword_search(
     agent_id: int | None = None,
     limit: int = 10,
 ) -> list[dict]:
-    """用 Chroma 的 where_document $contains 做关键词搜索。过滤目录页。"""
-    col = vector_store.get_collection()
-    results: list[dict] = []
-    seen_ids: set[str] = set()
+    """关键词搜索：Chroma 按班级取候选，再在内存中匹配关键词。"""
+    keywords = _usable_keywords(keywords)
+    if not keywords:
+        return []
 
-    where = _build_where(chapter_id, class_ids, course_id, agent_id=agent_id)
-
-    def _is_toc(text: str) -> bool:
-        """检测是否为目录页（含大量点引导符）。"""
-        dot_count = text[:300].count("…") + text[:300].count("．．") + text[:300].count("...")
-        return dot_count > 5
-
-    for kw in keywords:
-        per_kw_limit = 8 if kw in _GENERIC_KEYWORDS else 40
-        added = 0
-        try:
-            res = col.get(
-                where_document={"$contains": kw},
-                where=where,
-                limit=10000,
-            )
-            docs = res.get("documents", [])
-            metas = res.get("metadatas", [])
-            ids = res.get("ids", [])
-            for doc, meta, id_ in zip(docs, metas, ids):
-                if added >= per_kw_limit:
-                    break
-                if id_ not in seen_ids and not _is_toc(doc):
-                    seen_ids.add(id_)
-                    added += 1
-                    results.append({
-                        "document": doc,
-                        "metadata": meta,
-                        "distance": 0.0,
-                        "keyword": kw,
-                    })
-        except Exception:
-            continue
-
-    # 如果限定章节无结果，尝试放宽章节限制（仍保持班级/课程隔离）
-    if not results and chapter_id:
-        for kw in keywords:
-            per_kw_limit = 8 if kw in _GENERIC_KEYWORDS else 40
-            added = 0
-            try:
-                res = col.get(
-                    where_document={"$contains": kw},
-                    where=_build_where(None, class_ids, course_id, agent_id=agent_id),
-                    limit=10000,
-                )
-                docs = res.get("documents", [])
-                metas = res.get("metadatas", [])
-                ids = res.get("ids", [])
-                for doc, meta, id_ in zip(docs, metas, ids):
-                    if added >= per_kw_limit:
-                        break
-                    if id_ not in seen_ids and not _is_toc(doc):
-                        seen_ids.add(id_)
-                        added += 1
-                        results.append({
-                            "document": doc,
-                            "metadata": meta,
-                            "distance": 0.0,
-                            "keyword": kw,
-                        })
-            except Exception:
+    def _match(docs: list[tuple[str, dict, str]]) -> list[dict]:
+        results: list[dict] = []
+        seen_ids: set[str] = set()
+        per_kw_added: dict[str, int] = {kw: 0 for kw in keywords}
+        for doc, meta, id_ in docs:
+            if id_ in seen_ids:
                 continue
+            hit_kw = ""
+            for kw in keywords:
+                cap = 8 if kw in _GENERIC_KEYWORDS else 40
+                if per_kw_added[kw] >= cap:
+                    continue
+                if _doc_matches_kw(doc, kw):
+                    hit_kw = kw
+                    per_kw_added[kw] += 1
+                    break
+            if not hit_kw:
+                continue
+            seen_ids.add(id_)
+            results.append({
+                "document": doc,
+                "metadata": meta,
+                "distance": 0.0,
+                "keyword": hit_kw,
+            })
+            if len(results) >= max(limit, 30):
+                break
+        return results
 
+    docs = _fetch_scope_docs(chapter_id, class_ids, course_id=course_id, agent_id=agent_id)
+    results = _match(docs)
+    # 限定章节无结果时放宽章节（仍保持班级/课程隔离）
+    if not results and chapter_id is not None:
+        docs = _fetch_scope_docs(None, class_ids, course_id=course_id, agent_id=agent_id)
+        results = _match(docs)
     return results
 
 
@@ -407,31 +470,39 @@ def retrieve(
 
     # 1. 关键词搜索：扩展语义词，优先检索专业术语
     raw_keywords = _extract_keywords(question)
-    keywords = _expand_query_keywords(question, raw_keywords)
-    keywords = sorted(keywords, key=_keyword_specificity, reverse=True)
+    keywords = _usable_keywords(_expand_query_keywords(question, raw_keywords))
     keyword_hits = _keyword_search(
         keywords, chapter_id=chapter_id, class_ids=class_ids, course_id=course_id,
         agent_id=agent_id, limit=30,
     )
-    # 旧教材 chunk 常缺 course_id：在已有 class/agent 范围上再补一轮无 course 过滤
-    if course_id == 1:
-        keyword_hits = keyword_hits + _keyword_search(
-            keywords, chapter_id=chapter_id, class_ids=class_ids, course_id=None,
-            agent_id=agent_id, limit=30,
-        )
 
-    # 2. 向量搜索（作为补充）
-    where = _build_where(chapter_id, class_ids, course_id, agent_id=agent_id)
-    vector_hits = vector_store.query(question, n_results=k, where=where)
+    # 2. 向量搜索（作为补充）；where 仅用 class/chapter，再内存过滤 course/agent
+    where = _build_where(chapter_id, class_ids)
+    vector_hits = [
+        h for h in vector_store.query(question, n_results=max(k * 3, 12), where=where)
+        if _meta_matches_scope(
+            h.get("metadata"),
+            chapter_id=chapter_id,
+            class_ids=class_ids,
+            course_id=course_id,
+            agent_id=agent_id,
+            enforce_chapter=chapter_id is not None,
+        )
+    ]
     if not vector_hits and chapter_id:
-        vector_hits = vector_store.query(
-            question, n_results=k, where=_build_where(None, class_ids, course_id, agent_id=agent_id),
-        )
-    if course_id == 1:
-        vector_hits = vector_hits + vector_store.query(
-            question, n_results=k,
-            where=_build_where(chapter_id, class_ids, course_id=None, agent_id=agent_id),
-        )
+        vector_hits = [
+            h for h in vector_store.query(
+                question, n_results=max(k * 3, 12), where=_build_where(None, class_ids),
+            )
+            if _meta_matches_scope(
+                h.get("metadata"),
+                chapter_id=None,
+                class_ids=class_ids,
+                course_id=course_id,
+                agent_id=agent_id,
+                enforce_chapter=False,
+            )
+        ]
 
     # 3. 合并去重
     seen_docs: set[str] = set()
@@ -449,8 +520,8 @@ def retrieve(
             seen_docs.add(doc_key)
             merged.append(h)
 
-    # 兼容旧索引：仍为空时整体去掉 course_id 再检索一次
-    if not merged and course_id == 1:
+    # 兼容旧索引：仍为空时去掉 course_id 再检索一次
+    if not merged and course_id is not None:
         return retrieve(
             question, chapter_id=chapter_id, class_ids=class_ids, course_id=None, k=k,
             agent_id=agent_id,
@@ -459,6 +530,26 @@ def retrieve(
     # 4. 按多关键词匹配度排序，避免泛词（如「字符串」）挤占精确页码
     merged.sort(key=lambda h: _score_retrieval_hit(h, keywords), reverse=True)
     return merged[: max(k * 2, 10)]
+
+
+async def retrieve_async(
+    question: str,
+    chapter_id: int | None = None,
+    class_ids: list[int] | None = None,
+    course_id: int | None = None,
+    k: int | None = None,
+    agent_id: int | None = None,
+) -> list[dict]:
+    """在线程池执行同步检索，避免阻塞 uvicorn 事件循环（切页等其它 API 可继续响应）。"""
+    return await asyncio.to_thread(
+        retrieve,
+        question,
+        chapter_id,
+        class_ids,
+        course_id,
+        k,
+        agent_id,
+    )
 
 
 async def rag_stream(
@@ -476,9 +567,12 @@ async def rag_stream(
 ) -> tuple[list[dict], AsyncGenerator[str, None]]:
     """返回 (检索结果, 流式生成器)。"""
     query_for_retrieve = (search_query or question).strip()
-    hits = precomputed_hits if precomputed_hits is not None else retrieve(
-        query_for_retrieve, chapter_id=chapter_id, class_ids=class_ids, course_id=course_id,
-    )
+    if precomputed_hits is not None:
+        hits = precomputed_hits
+    else:
+        hits = await retrieve_async(
+            query_for_retrieve, chapter_id=chapter_id, class_ids=class_ids, course_id=course_id,
+        )
     context = _build_context(hits, agent_slug)
     normal_tpl, attach_tpl = get_prompt_templates(agent_slug)
     rec_block = recommendations_text or "（暂无匹配的已上传资源）"

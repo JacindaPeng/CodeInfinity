@@ -108,32 +108,6 @@ def _assert_agent_name_unique(db: DBSession, owner_id: int, name: str, exclude_i
         raise HTTPException(400, f"您已有同名智能体「{name}」")
 
 
-def _assert_slug_unique_for_owner(
-    db: DBSession,
-    owner_id: int,
-    slug: str,
-    exclude_id: int | None = None,
-    *,
-    previous_slug: str | None = None,
-) -> None:
-    """同教师同语言仅允许一台智能体；更新时若语言未变则放行（兼容历史重复数据）。"""
-    slug = (slug or "").strip().lower()
-    if not slug:
-        return
-    prev = (previous_slug or "").strip().lower()
-    if exclude_id is not None and prev and prev == slug:
-        return
-    q = select(Agent).where(Agent.owner_id == owner_id, Agent.slug == slug)
-    if exclude_id:
-        q = q.where(Agent.id != exclude_id)
-    existing = db.scalar(q)
-    if existing:
-        raise HTTPException(
-            400,
-            f"您已有同语言智能体「{existing.name}」，请直接使用或先删除，勿重复创建",
-        )
-
-
 def _enrich_agent_dict(db: DBSession, agent: Agent) -> dict:
     d = _agent_dict(agent, db)
     owner = db.get(User, agent.owner_id) if agent.owner_id else None
@@ -267,7 +241,6 @@ def list_adopters(agent_id: int, user: CurrentUser, db: DBSession) -> dict:
 def create_agent(payload: TeacherAgentIn, user: CurrentUser, db: DBSession) -> dict:
     _assert_course(db, payload.course_id)
     _assert_agent_name_unique(db, user.id, payload.name)
-    _assert_slug_unique_for_owner(db, user.id, payload.slug)
     agent = Agent(
         name=payload.name,
         intro=payload.intro,
@@ -288,15 +261,10 @@ def update_agent(agent_id: int, payload: TeacherAgentIn, user: CurrentUser, db: 
     agent = assert_agent_owner(db, user, agent_id)
     _assert_course(db, payload.course_id)
     _assert_agent_name_unique(db, user.id, payload.name, exclude_id=agent_id)
-    new_slug = (payload.slug or "").strip().lower()
-    old_slug = (agent.slug or "").strip().lower()
-    # 未改语言时放行：历史上可能已有同 slug 重复记录，否则无法保存名称/状态等字段
-    if new_slug != old_slug:
-        _assert_slug_unique_for_owner(db, user.id, new_slug, exclude_id=agent_id)
     agent.name = payload.name
     agent.intro = payload.intro
     agent.course_id = payload.course_id
-    agent.slug = new_slug
+    agent.slug = (payload.slug or "").strip().lower()
     if payload.status != "active" and agent.is_shared:
         agent.is_shared = False
         agent.shared_at = None

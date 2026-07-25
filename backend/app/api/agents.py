@@ -1,4 +1,5 @@
 """智能体管理 + 课程问答 SSE。"""
+import asyncio
 import json
 import time
 
@@ -22,7 +23,7 @@ from ..services.agent_access import (
 )
 from ..services.chapter_sync import uses_course_level_preset_chapters
 from ..services.llm_provider import get_provider
-from ..services.rag_service import rag_stream, retrieve
+from ..services.rag_service import rag_stream, retrieve_async
 from .chat import (
     AttachmentIn,
     _attachments_for_log,
@@ -197,15 +198,31 @@ async def course_ask(payload: CourseAskIn, user: CurrentUser, db: DBSession):
         build_attachment_search_query(payload.attachments, payload.question)
         if has_attachments else payload.question
     )
-    hits = retrieve(
+    # Chroma 检索放线程池，避免堵住事件循环导致切页等请求一起卡死
+    hits = await retrieve_async(
         search_query, chapter_id=payload.chapter_id, class_ids=retrieval_class_ids,
         course_id=course_id, agent_id=retrieval_agent_id,
     )
     if has_attachments:
-        recommendations = recommend_service.recommend_from_attachment(
-            db, payload.attachments, retrieval_class_ids, payload.chapter_id,
-            course_id=course_id, agent_id=retrieval_agent_id,
-            question=payload.question,
+        attach_hits = await asyncio.to_thread(
+            recommend_service.collect_attachment_hits,
+            payload.attachments,
+            retrieval_class_ids,
+            payload.chapter_id,
+            course_id,
+            retrieval_agent_id,
+        )
+        recommendations = recommend_service.recommend_from_hits(db, attach_hits)
+        recommendations = recommend_service.ensure_video_recommendations(
+            db, recommendations, payload.question or search_query,
+            chapter_id=payload.chapter_id,
+            class_ids=retrieval_class_ids,
+            course_id=course_id,
+            agent_id=retrieval_agent_id,
+            hits=attach_hits or hits,
+        )
+        recommendations = recommend_service.filter_relevant_recommendations(
+            recommendations, attach_hits or hits, payload.question or search_query,
         )
     else:
         recommendations = recommend_service.recommend_from_hits(db, hits)

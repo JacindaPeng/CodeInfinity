@@ -413,7 +413,7 @@ async function loadAdaptiveRecommend() {
   }
 }
 
-const typeTag = (t: string) => ({ 选择题: '', 判断题: 'success', 简答题: 'warning' } as any)[t] || (t === 'pdf' ? 'danger' : t === 'ppt' ? 'warning' : t === 'video' ? 'success' : 'info')
+const typeTag = (t: string) => ({ 选择题: '', 判断题: 'success', 填空题: 'info', 简答题: 'warning' } as any)[t] || (t === 'pdf' ? 'danger' : t === 'ppt' ? 'warning' : t === 'video' ? 'success' : 'info')
 
 function fmtTime(s: number) {
   return fmtVideoTime(s)

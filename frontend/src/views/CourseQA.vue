@@ -70,7 +70,7 @@ const selectedClassId = ref<number | undefined>(undefined)
 const myEnrollments = ref<Enrollment[]>([])
 const userStore = useAuthStore()
 const agentStore = useCourseAgentStore()
-const { loadScopedClasses, pickClassId, isSharedPreview } = useAgentBoundClasses()
+const { loadScopedClasses, pickClassId } = useAgentBoundClasses()
 const router = useRouter()
 const needsAgentGuide = computed(() => !agentStore.current)
 const agentPlanned = computed(() => agentStore.current && !agentStore.isActive())
@@ -786,16 +786,6 @@ onUnmounted(() => {
         </template>
 
         <el-alert
-          v-if="isSharedPreview"
-          type="info"
-          :closable="false"
-          show-icon
-          title="正在体验共享智能体问答"
-          description="检索范围来自源教师共享资料。若回答空洞，请确认左侧班级筛选为源侧班级。"
-          style="margin-bottom: 8px"
-        />
-
-        <el-alert
           v-if="needsAgentGuide"
           type="warning"
           :closable="false"
@@ -955,13 +945,10 @@ onUnmounted(() => {
       <el-card shadow="never" class="side-card tips-card">
         <template #header>使用说明</template>
         <ul class="tips-list">
-          <li>教师需先选择班级，检索与推荐仅使用该班在「资料管理」中的资源</li>
-          <li>学生自动使用所属班级的课程资料</li>
-          <li>选择章节后，检索范围将限定在该章节</li>
-          <li>回答下方会列出推荐资源（PPT/PDF/视频）</li>
-          <li>视频推荐支持「精准跳转到对应知识点时间点」</li>
-          <li>支持上传 PDF、Word、PPT、代码等文件辅助提问</li>
-          <li>支持语音输入（优先本地录音识别）</li>
+          <li>教师配置班级课程资料库，基于资料库完成课程问答</li>
+          <li>可选章节以缩小检索范围</li>
+          <li>回答下方会推荐 PPT / PDF / 视频</li>
+          <li>支持上传文件、语音提问</li>
         </ul>
       </el-card>
 

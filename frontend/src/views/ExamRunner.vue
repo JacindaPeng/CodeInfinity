@@ -135,6 +135,14 @@ onMounted(load)
       </el-radio-group>
     </div>
 
+    <div v-else-if="cur.type === '填空题'" style="margin: 16px 0">
+      <el-input
+        v-model="answers[cur.idx]"
+        placeholder="请填写空缺内容"
+        clearable
+      />
+    </div>
+
     <div v-else style="margin: 16px 0">
       <el-input
         v-model="answers[cur.idx]"

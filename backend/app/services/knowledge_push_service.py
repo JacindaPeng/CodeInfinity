@@ -106,11 +106,11 @@ def _weak_keyword_set(targets: list[dict]) -> set[str]:
 
 
 def _normalize_kp_display_hits(hits: list[str], targets: list[dict]) -> list[str]:
-    """展示用标签：必须是完整薄弱点，否则归为课程延伸阅读。"""
+    """展示用标签：必须是完整薄弱点，且只保留最相关的一个；否则归为课程延伸阅读。"""
     official = set(_official_weak_names(targets))
     valid = [h for h in hits if h in official]
     if valid:
-        return list(dict.fromkeys(valid))[:8]
+        return [valid[0]]
     return ["课程延伸阅读"]
 
 
@@ -128,6 +128,10 @@ def _sanitize_false_weak_reasons(
     for p in rows:
         hits = list(p.kp_names_json or [])
         if hits and all(h in weak_keys for h in hits):
+            # 历史误堆多个薄弱点：只保留第一个
+            if len(hits) > 1:
+                p.kp_names_json = [hits[0]]
+                fixed += 1
             continue
         if hits in (["延伸阅读"], ["课程延伸阅读"]) or not hits:
             if p.kp_names_json != ["课程延伸阅读"]:
@@ -228,12 +232,29 @@ def _match_articles(
     return leftovers
 
 
+def _weak_name_fragments(name: str) -> list[str]:
+    """从较长薄弱点名中抽出可匹配片段。"""
+    name = (name or "").strip()
+    if not name:
+        return []
+    frags = [name.lower()]
+    frags.extend(re.findall(r"[\u4e00-\u9fff]{2,12}", name))
+    frags.extend(re.findall(r"[A-Za-z][A-Za-z0-9_+#.]{1,16}", name))
+    # 去短噪声
+    out: list[str] = []
+    for f in frags:
+        s = f.strip().lower()
+        if len(s) >= 2 and s not in out:
+            out.append(s)
+    return out
+
+
 def _match_runoob_tutorials(
     articles: list[KnowledgeArticle],
     targets: list[dict],
     already: set[int],
 ) -> list[tuple[float, KnowledgeArticle, list[str]]]:
-    """按薄弱点中的关键短语匹配菜鸟教程；命中项优先于课外内容。"""
+    """按薄弱点匹配菜鸟教程；每篇只保留得分最高的一个薄弱点。"""
     scored: list[tuple[float, KnowledgeArticle, list[str]]] = []
     for art in articles:
         if art.id in already or not art.source or art.source.name != "菜鸟教程":
@@ -243,22 +264,156 @@ def _match_runoob_tutorials(
             for k in (art.keywords_json or [])
             if str(k).strip()
         ]
-        hits: list[str] = []
-        score = 0.0
+        title_blob = f"{art.title or ''} {art.summary or ''}".lower()
+        best_name = ""
+        best_score = 0.0
         for target in targets:
             name = str(target.get("kp_name") or "")
-            lower = name.lower()
-            matched = [k for k in keywords if k in lower or lower in k]
+            if not name:
+                continue
+            frags = _weak_name_fragments(name)
+            matched = [
+                k for k in keywords
+                if any(k in f or f in k for f in frags)
+            ]
+            if not matched:
+                matched = [f for f in frags if f in title_blob and len(f) >= 2]
             if not matched:
                 continue
-            hits.append(name)
-            score += 20.0 + float(target.get("weight") or 0) + max(
-                len(k) for k in matched
+            score = 20.0 + float(target.get("weight") or 0) + max(
+                len(m) for m in matched
             ) * 0.2
-        if hits:
-            scored.append((score, art, list(dict.fromkeys(hits))))
+            if score > best_score:
+                best_score = score
+                best_name = name
+        if best_name:
+            scored.append((best_score, art, [best_name]))
     scored.sort(key=lambda row: -row[0])
     return scored
+
+
+def _best_runoob_weak_pair(
+    runoob_articles: list[KnowledgeArticle],
+    targets: list[dict],
+    already: set[int],
+    *,
+    force: bool = False,
+) -> tuple[KnowledgeArticle, str, float] | None:
+    """在菜鸟教程与考核薄弱点间找一对最相关的（一篇教程 × 一个薄弱点）。"""
+    best: tuple[float, KnowledgeArticle, str] | None = None
+    for art in runoob_articles:
+        if (not force) and art.id in already:
+            continue
+        blob = f"{art.title or ''} {art.summary or ''} {' '.join(str(k) for k in (art.keywords_json or []))}".lower()
+        for target in targets:
+            name = str(target.get("kp_name") or "")
+            if not name:
+                continue
+            frags = _weak_name_fragments(name)
+            hit_n = sum(1 for f in frags if f in blob)
+            if hit_n <= 0:
+                continue
+            score = hit_n * 10.0 + float(target.get("weight") or 0) + max(len(f) for f in frags if f in blob) * 0.1
+            if best is None or score > best[0]:
+                best = (score, art, name)
+    if not best:
+        return None
+    return best[1], best[2], best[0]
+
+
+def _force_revive_or_create_push(
+    db: Session,
+    *,
+    user_id: int,
+    agent_id: int | None,
+    course_id: int | None,
+    art: KnowledgeArticle,
+    reason: str,
+    hits: list[str],
+) -> KnowledgePush | None:
+    """新建，或把已读/已忽略复活为未读（未读则原地刷新时间戳并返回）。"""
+    hits = (hits or [])[:1]
+    existing = db.scalar(
+        select(KnowledgePush).where(
+            KnowledgePush.user_id == user_id,
+            KnowledgePush.article_id == art.id,
+        )
+    )
+    if existing:
+        existing.status = "unread"
+        existing.reason = reason
+        existing.kp_names_json = hits
+        existing.agent_id = agent_id
+        existing.course_id = course_id
+        existing.pushed_at = datetime.utcnow()
+        existing.read_at = None
+        return existing
+    return _revive_or_create_push(
+        db,
+        user_id=user_id,
+        agent_id=agent_id,
+        course_id=course_id,
+        art=art,
+        reason=reason,
+        hits=hits,
+    )
+
+
+def _create_runoob_weak_push(
+    db: Session,
+    *,
+    user_id: int,
+    agent_id: int | None,
+    course_id: int | None,
+    runoob_articles: list[KnowledgeArticle],
+    targets: list[dict],
+    already: set[int],
+    force: bool = False,
+) -> KnowledgePush | None:
+    """生成一条「菜鸟教程 × 单个薄弱点」推送；不堆砌无关薄弱点。"""
+    official = _official_weak_names(targets)
+    if not official or not runoob_articles:
+        return None
+
+    scored = _match_runoob_tutorials(runoob_articles, targets, set() if force else already)
+    for _score, art, hits in scored:
+        hits_n = _normalize_kp_display_hits(hits, targets)[:1]
+        if not hits_n or hits_n == ["课程延伸阅读"]:
+            continue
+        if (not force) and art.id in already:
+            continue
+        reason = f"根据薄弱点优先推荐菜鸟教程：{hits_n[0]}"
+        maker = _force_revive_or_create_push if force else _revive_or_create_push
+        push = maker(
+            db,
+            user_id=user_id,
+            agent_id=agent_id,
+            course_id=course_id,
+            art=art,
+            reason=reason,
+            hits=hits_n,
+        )
+        if push:
+            return push
+
+    # 软匹配：必须教程内容与某一个薄弱点真正相关，只挂这一个标签
+    pair = _best_runoob_weak_pair(
+        runoob_articles, targets, already, force=force,
+    )
+    if not pair:
+        return None
+    art, kp_name, _score = pair
+    reason = f"根据薄弱点优先推荐菜鸟教程：{kp_name}"
+    maker = _force_revive_or_create_push if force else _revive_or_create_push
+    return maker(
+        db,
+        user_id=user_id,
+        agent_id=agent_id,
+        course_id=course_id,
+        art=art,
+        reason=reason,
+        hits=[kp_name],
+    )
 
 
 def _eligible_article_ids(db: Session, user_id: int) -> set[int]:
@@ -295,7 +450,7 @@ def _revive_or_create_push(
             return None
         existing.status = "unread"
         existing.reason = reason
-        existing.kp_names_json = hits[:8]
+        existing.kp_names_json = hits[:1]
         existing.agent_id = agent_id
         existing.course_id = course_id
         existing.pushed_at = datetime.utcnow()
@@ -308,7 +463,7 @@ def _revive_or_create_push(
         course_id=course_id,
         article_id=art.id,
         reason=reason,
-        kp_names_json=hits[:8],
+        kp_names_json=hits[:1],
         status="unread",
     )
     db.add(push)
@@ -348,6 +503,76 @@ def _meta_from_targets(
     return None, None
 
 
+def _want_lang(lang: str) -> str:
+    lang = (lang or "any").lower()
+    if lang in ("zh", "zh-cn", "zh_cn", "chinese"):
+        return "zh"
+    if lang in ("en", "english"):
+        return "en"
+    return "any"
+
+
+def _hits_are_extended(hits: list[str] | None) -> bool:
+    hs = list(hits or [])
+    return (not hs) or all(h in ("课程延伸阅读", "延伸阅读") for h in hs)
+
+
+def _split_weak_extended(
+    scored: list[tuple[float, KnowledgeArticle, list[str]]],
+    targets: list[dict],
+) -> tuple[
+    list[tuple[float, KnowledgeArticle, list[str]]],
+    list[tuple[float, KnowledgeArticle, list[str]]],
+]:
+    weak: list[tuple[float, KnowledgeArticle, list[str]]] = []
+    extended: list[tuple[float, KnowledgeArticle, list[str]]] = []
+    for score, art, hits in scored:
+        hits_n = _normalize_kp_display_hits(hits, targets)
+        row = (score, art, hits_n)
+        if _hits_are_extended(hits_n):
+            extended.append(row)
+        else:
+            weak.append(row)
+    return weak, extended
+
+
+def _append_push(
+    db: Session,
+    *,
+    created: list[KnowledgePush],
+    already: set[int],
+    user_id: int,
+    agent_id: int | None,
+    course_id: int | None,
+    art: KnowledgeArticle,
+    hits: list[str],
+    targets: list[dict],
+) -> bool:
+    if art.id in already:
+        return False
+    hits = _normalize_kp_display_hits(hits, targets)
+    if _hits_are_extended(hits):
+        reason = "结合你的多课程学习情况推荐"
+    elif art.source and art.source.name == "菜鸟教程":
+        reason = f"根据薄弱点优先推荐菜鸟教程：{hits[0]}"
+    else:
+        reason = f"根据你的考核报告薄弱点推荐：{hits[0]}"
+    push = _revive_or_create_push(
+        db,
+        user_id=user_id,
+        agent_id=agent_id,
+        course_id=course_id,
+        art=art,
+        reason=reason,
+        hits=hits,
+    )
+    if not push:
+        return False
+    already.add(art.id)
+    created.append(push)
+    return True
+
+
 def push_for_student(
     db: Session,
     user: User,
@@ -357,12 +582,18 @@ def push_for_student(
     lang: str = "any",
     resource_type: str = "all",
 ) -> list[KnowledgePush]:
-    """薄弱点优先匹配菜鸟教程，再从分类白名单补充课外内容。"""
+    """按语言生成推送。
+
+    - 英文：只推英文内容；找不到英文薄弱点匹配则不强推薄弱点（不用中文菜鸟教程凑数）
+    - 中文：limit>=2 时优先 1 条菜鸟教程薄弱点
+    - limit>2：在两类都有候选时，至少各 1 条（薄弱点 + 课外扩展）
+    """
     limit = limit if limit is not None else settings.knowledge_push_limit
     limit = max(1, min(int(limit), 20))
     resource_type = (resource_type or "all").lower()
     if resource_type not in ("all", "article", "podcast", "video", "twitter"):
         resource_type = "all"
+    want = _want_lang(lang)
 
     created: list[KnowledgePush] = []
     already = _eligible_article_ids(db, user.id)
@@ -391,13 +622,30 @@ def push_for_student(
                 .limit(300)
             ).all()
         )
+
+    # 菜鸟教程仅用于中文/不限语言；英文模式绝不混入
+    runoob_all = (
+        list(
+            db.scalars(
+                select(KnowledgeArticle)
+                .join(KnowledgeSource)
+                .where(
+                    KnowledgeSource.enabled.is_(True),
+                    KnowledgeSource.name == "菜鸟教程",
+                )
+                .order_by(KnowledgeArticle.id.asc())
+            ).all()
+        )
+        if want != "en" and resource_type in ("all", "article")
+        else []
+    )
+
     articles = _filter_articles_by_lang(articles, lang)
     if resource_type != "all":
         articles = [
             a for a in articles if (a.resource_type or "article") == resource_type
         ]
 
-    # 薄弱点：始终汇总所有课程报告
     targets = resolve_student_weak_targets(
         db, user, course_id=None, agent_id=None, all_courses=True
     )
@@ -409,7 +657,6 @@ def push_for_student(
         db.flush()
         already = _eligible_article_ids(db, user.id)
 
-    # 合并学生各课程关键词，提高跨课匹配
     course_ids: set[int] = set()
     for ag in _active_agents_for_student(db, user):
         if ag.course_id:
@@ -424,45 +671,138 @@ def push_for_student(
         course_keywords.extend(_course_keywords(db, None))
     course_keywords = list(dict.fromkeys(course_keywords))
 
-    runoob_scored = (
-        _match_runoob_tutorials(articles, targets, already)
-        if resource_type in ("all", "article")
-        else []
-    )
+    agent_id, course_id = _meta_from_targets(db, targets, agent)
+
     external_articles = [
         a for a in articles if not a.source or a.source.name != "菜鸟教程"
     ]
-    scored = runoob_scored + _match_articles(
-        external_articles, targets, already,
-        course_keywords=course_keywords, fill_unmatched=True,
+    runoob_scored = (
+        _match_runoob_tutorials(runoob_all, targets, already) if runoob_all else []
+    )
+    external_scored = _match_articles(
+        external_articles,
+        targets,
+        already,
+        course_keywords=course_keywords,
+        fill_unmatched=True,
     )
 
-    agent_id, course_id = _meta_from_targets(db, targets, agent)
-    for _score, art, hits in scored:
-        if len(created) >= limit:
-            break
-        if art.id in already:
-            continue
-        hits = _normalize_kp_display_hits(hits, targets)
-        if hits == ["课程延伸阅读"]:
-            reason = "结合你的多课程学习情况推荐"
-        elif art.source and art.source.name == "菜鸟教程":
-            reason = f"根据薄弱点优先推荐菜鸟教程：{'、'.join(hits[:4])}"
-        else:
-            reason = f"根据你的考核报告薄弱点推荐：{'、'.join(hits[:4])}"
-        push = _revive_or_create_push(
+    weak_pool, ext_pool = _split_weak_extended(
+        runoob_scored + external_scored, targets
+    )
+    # 英文薄弱点只能来自英文课外文；中文可含菜鸟
+    if want == "en":
+        weak_pool = [
+            (s, a, h) for s, a, h in weak_pool
+            if not a.source or a.source.name != "菜鸟教程"
+        ]
+
+    def take_one(
+        pool: list[tuple[float, KnowledgeArticle, list[str]]],
+    ) -> bool:
+        while pool:
+            _s, art, hits = pool.pop(0)
+            if _append_push(
+                db,
+                created=created,
+                already=already,
+                user_id=user.id,
+                agent_id=agent_id,
+                course_id=course_id,
+                art=art,
+                hits=hits,
+                targets=targets,
+            ):
+                return True
+        return False
+
+    # 中文：limit>=2 时先占菜鸟教程薄弱点（找不到再走通用薄弱点池）
+    if want != "en" and limit >= 2 and runoob_all:
+        guaranteed = _create_runoob_weak_push(
             db,
             user_id=user.id,
             agent_id=agent_id,
             course_id=course_id,
-            art=art,
-            reason=reason,
-            hits=hits,
+            runoob_articles=runoob_all,
+            targets=targets,
+            already=already,
+            force=False,
         )
-        if not push:
-            continue
-        already.add(art.id)
-        created.append(push)
+        if not guaranteed:
+            guaranteed = _create_runoob_weak_push(
+                db,
+                user_id=user.id,
+                agent_id=agent_id,
+                course_id=course_id,
+                runoob_articles=runoob_all,
+                targets=targets,
+                already=already,
+                force=True,
+            )
+        if guaranteed:
+            created.append(guaranteed)
+            already.add(guaranteed.article_id)
+            # 同步从池中去掉
+            weak_pool = [(s, a, h) for s, a, h in weak_pool if a.id != guaranteed.article_id]
+            ext_pool = [(s, a, h) for s, a, h in ext_pool if a.id != guaranteed.article_id]
+
+    has_weak_left = bool(weak_pool)
+    has_ext_left = bool(ext_pool)
+
+    # 英文：仅当确有英文薄弱点候选时才预留；否则不强推
+    if want == "en" and limit >= 2 and has_weak_left and not any(
+        not _hits_are_extended(p.kp_names_json) for p in created
+    ):
+        take_one(weak_pool)
+        has_weak_left = bool(weak_pool)
+
+    # limit>2：在两类都有时，保证至少各一条
+    if limit > 2:
+        have_weak = any(not _hits_are_extended(p.kp_names_json) for p in created)
+        have_ext = any(_hits_are_extended(p.kp_names_json) for p in created)
+        if not have_weak and has_weak_left:
+            take_one(weak_pool)
+        if not have_ext and has_ext_left:
+            take_one(ext_pool)
+
+    # limit==2 且尚无扩展：尽量补一条课外（中文菜鸟已占一条时）
+    if limit == 2 and len(created) < 2:
+        have_ext = any(_hits_are_extended(p.kp_names_json) for p in created)
+        have_weak = any(not _hits_are_extended(p.kp_names_json) for p in created)
+        if have_weak and not have_ext and ext_pool:
+            take_one(ext_pool)
+        elif have_ext and not have_weak and weak_pool and want != "en":
+            take_one(weak_pool)
+        elif want == "en" and weak_pool and not have_weak:
+            take_one(weak_pool)
+        elif ext_pool:
+            take_one(ext_pool)
+
+    # 剩余名额：交替取，避免全是同一类
+    while len(created) < limit:
+        have_weak = any(not _hits_are_extended(p.kp_names_json) for p in created)
+        have_ext = any(_hits_are_extended(p.kp_names_json) for p in created)
+        progressed = False
+        # 若还缺某一类且还有名额，优先补齐
+        if limit > 2 and not have_weak and weak_pool:
+            progressed = take_one(weak_pool)
+        elif limit > 2 and not have_ext and ext_pool:
+            progressed = take_one(ext_pool)
+        else:
+            # 交替：刚加过薄弱则下一条优先扩展
+            last_ext = (
+                _hits_are_extended(created[-1].kp_names_json) if created else True
+            )
+            if last_ext and weak_pool:
+                progressed = take_one(weak_pool)
+            elif (not last_ext) and ext_pool:
+                progressed = take_one(ext_pool)
+            elif ext_pool:
+                progressed = take_one(ext_pool)
+            elif weak_pool:
+                progressed = take_one(weak_pool)
+        if not progressed:
+            break
 
     return created
 
@@ -580,7 +920,10 @@ def _push_relaxing_already(
     limit: int | None,
     resource_type: str,
 ) -> list[KnowledgePush]:
-    """当未读/已读占满文库时：仅把「已读」文复活为新推送（未读不重复）。"""
+    """当未读/已读占满文库时：仅把「已读」文复活为新推送（未读不重复）。
+
+    limit>=2 时同样优先复活一条菜鸟教程薄弱点。
+    """
     limit = limit if limit is not None else settings.knowledge_push_limit
     limit = max(1, min(int(limit), 20))
     unread_ids = set(
@@ -602,7 +945,7 @@ def _push_relaxing_already(
             .limit(80)
         ).all()
     )
-    if not read_rows:
+    if not read_rows and limit < 2:
         return []
 
     articles = list(
@@ -611,10 +954,12 @@ def _push_relaxing_already(
             .join(KnowledgeSource)
             .where(
                 KnowledgeSource.enabled.is_(True),
-                KnowledgeArticle.id.in_([p.article_id for p in read_rows]),
+                KnowledgeArticle.id.in_(
+                    [p.article_id for p in read_rows] or [0]
+                ),
             )
         ).all()
-    )
+    ) if read_rows else []
     articles = _filter_articles_by_lang(articles, lang)
     if resource_type != "all":
         articles = [
@@ -623,7 +968,35 @@ def _push_relaxing_already(
     art_by_id = {a.id: a for a in articles}
     created: list[KnowledgePush] = []
     targets = resolve_student_weak_targets(db, user, all_courses=True)
+    if not targets:
+        targets = [{"chapter_id": None, "kp_name": "编程", "weight": 1.0}]
     agent_id, course_id = _meta_from_targets(db, targets, agent)
+
+    if limit >= 2 and resource_type in ("all", "article") and _want_lang(lang) != "en":
+        runoob_all = list(
+            db.scalars(
+                select(KnowledgeArticle)
+                .join(KnowledgeSource)
+                .where(
+                    KnowledgeSource.enabled.is_(True),
+                    KnowledgeSource.name == "菜鸟教程",
+                )
+            ).all()
+        )
+        guaranteed = _create_runoob_weak_push(
+            db,
+            user_id=user.id,
+            agent_id=agent_id,
+            course_id=course_id,
+            runoob_articles=runoob_all,
+            targets=targets,
+            already=unread_ids,
+            force=True,
+        )
+        if guaranteed:
+            created.append(guaranteed)
+            unread_ids.add(guaranteed.article_id)
+
     for p in read_rows:
         if len(created) >= limit:
             break
@@ -635,6 +1008,7 @@ def _push_relaxing_already(
         # 复活为未读视为新一轮推荐
         p.status = "unread"
         p.reason = "再次推荐：精选延伸阅读"
+        p.kp_names_json = ["课程延伸阅读"]
         p.pushed_at = datetime.utcnow()
         p.read_at = None
         if agent_id is not None:

@@ -1,7 +1,7 @@
 """章节考核服务：试卷生成 / 评分 / 评价报告。
 
 生成策略：题库优先抽题；不足题型用 LLM 基于章节知识点动态补足。
-评分策略：客观题提取首字母比对；简答题用 LLM 按「标准答案 + 维度」打分。
+评分策略：选择/判断提取关键标识比对；填空题规范化字符串比对（支持多答案）；简答题用 LLM 打分。
 报告策略：LLM 按 3 维度生成评价 + 薄弱知识点列表 + 总分持久化。
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ from ..deps import get_exam_config
 from .agent_access import get_shared_exam_config, is_adopted_snapshot, resolve_agent_for_exam, resolve_bank_class_ids
 from .llm_provider import get_provider
 
-TYPE_LABEL = {"选择题": "选择题", "判断题": "判断题", "简答题": "简答题"}
+TYPE_LABEL = {"选择题": "选择题", "判断题": "判断题", "填空题": "填空题", "简答题": "简答题"}
 
 
 def _get_kp_names(
@@ -72,6 +72,7 @@ def _llm_generate_questions(
 2. 严格输出 JSON 数组，每个元素格式：
    - 选择题: {{"type":"选择题","stem":"...","options":["A. ...","B. ...","C. ...","D. ..."],"answer":"A","analysis":"..."}}
    - 判断题: {{"type":"判断题","stem":"...","options":["对","错"],"answer":"对","analysis":"..."}}
+   - 填空题: {{"type":"填空题","stem":"...（用____表示空）","options":[],"answer":"标准答案；多个可接受答案用|分隔","analysis":"..."}}
    - 简答题: {{"type":"简答题","stem":"...","options":[],"answer":"参考答案要点...","analysis":"评分要点：..."}}
 3. 只输出 JSON，不要任何解释或 markdown 代码块
 """
@@ -269,6 +270,25 @@ def _grade_objective(q: ExamQuestion) -> tuple[bool, float]:
     return ok, 100.0 if ok else 0.0
 
 
+def _normalize_blank(ans: str) -> str:
+    """填空题比对：去空白、统一大小写与常见全角符号。"""
+    s = (ans or "").strip().lower()
+    s = s.replace("＿", "_").replace("—", "-").replace("－", "-")
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+def _grade_fill_blank(q: ExamQuestion) -> tuple[bool, float]:
+    """填空题客观比对；标准答案可用 | / ； 分隔多个可接受写法。"""
+    user = _normalize_blank(q.user_answer or "")
+    if not user:
+        return False, 0.0
+    raw = (q.correct_answer or "").strip()
+    candidates = [c.strip() for c in re.split(r"[|/；;]", raw) if c.strip()] or [raw]
+    ok = any(user == _normalize_blank(c) for c in candidates)
+    return ok, 100.0 if ok else 0.0
+
+
 def _grade_subjective(db: Session, q: ExamQuestion) -> tuple[bool, float, str]:
     """LLM 评分简答题，返回 (是否合格, 0-100 分, 评语)。"""
     prompt = f"""你是C语言课程阅卷助手。请对学生的简答题作答评分。
@@ -310,6 +330,11 @@ def grade_exam(db: Session, exam: Exam) -> Exam:
             continue
         if q.type in ("选择题", "判断题"):
             ok, score = _grade_objective(q)
+            q.is_correct = ok
+            q.ai_score = score
+            q.ai_feedback = "正确" if ok else f"错误，正确答案: {q.correct_answer}"
+        elif q.type == "填空题":
+            ok, score = _grade_fill_blank(q)
             q.is_correct = ok
             q.ai_score = score
             q.ai_feedback = "正确" if ok else f"错误，正确答案: {q.correct_answer}"

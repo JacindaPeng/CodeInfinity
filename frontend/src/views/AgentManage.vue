@@ -455,30 +455,34 @@ onMounted(() => {
     </div>
 
     <template v-if="!isTeacher || activeTab === 'enter'">
-      <el-row :gutter="16">
-        <el-col v-for="a in filteredEnterList" :key="a.id" :xs="24" :sm="12" :md="8">
-          <el-card shadow="hover" class="agent-card" @click="openAgent(a)">
-            <div class="agent-card-head" :style="{ background: theme(a.slug).bg }">
-              <div class="agent-icon" :style="{ color: theme(a.slug).color }">{{ a.name.charAt(0) }}</div>
-              <el-tag :type="statusTag(a.status).type" size="small">{{ statusTag(a.status).label }}</el-tag>
-            </div>
-            <h3>{{ a.name }}</h3>
-            <p class="agent-intro">{{ a.intro }}</p>
-            <div class="agent-meta">
-              <span v-if="a.course_name" class="course-name">{{ a.course_name }}</span>
-              <span v-if="a.owner_name" class="owner-tag">· {{ a.owner_name }}</span>
-              <el-tag v-if="a.is_adopted" size="small" type="warning" style="margin-left: 4px">已采纳</el-tag>
-              <el-tag
-                v-if="isStudentUser && !isEnrolledForAgent(a)"
-                size="small"
-                type="danger"
-                style="margin-left: 4px"
-              >未加入班级</el-tag>
-            </div>
-            <span class="enter-hint">进入课程 →</span>
-          </el-card>
-        </el-col>
-      </el-row>
+      <div class="agent-grid">
+        <el-card
+          v-for="a in filteredEnterList"
+          :key="a.id"
+          shadow="hover"
+          class="agent-card"
+          @click="openAgent(a)"
+        >
+          <div class="agent-card-head" :style="{ background: theme(a.slug).bg }">
+            <div class="agent-icon" :style="{ color: theme(a.slug).color }">{{ a.name.charAt(0) }}</div>
+            <el-tag :type="statusTag(a.status).type" size="small">{{ statusTag(a.status).label }}</el-tag>
+          </div>
+          <h3>{{ a.name }}</h3>
+          <p class="agent-intro">{{ a.intro || '暂无介绍' }}</p>
+          <div class="agent-meta">
+            <span v-if="a.course_name" class="course-name">{{ a.course_name }}</span>
+            <span v-if="a.owner_name" class="owner-tag">· {{ a.owner_name }}</span>
+            <el-tag v-if="a.is_adopted" size="small" type="warning" style="margin-left: 4px">已采纳</el-tag>
+            <el-tag
+              v-if="isStudentUser && !isEnrolledForAgent(a)"
+              size="small"
+              type="danger"
+              style="margin-left: 4px"
+            >未加入班级</el-tag>
+          </div>
+          <span class="enter-hint">进入课程 →</span>
+        </el-card>
+      </div>
       <el-empty
         v-if="!filteredEnterList.length"
         :description="courseFilter ? '当前课程下暂无可进入的智能体' : '暂无可进入的课程智能体'"
@@ -543,50 +547,48 @@ onMounted(() => {
     </template>
 
     <template v-else>
-      <el-row :gutter="16">
-        <el-col v-for="a in filteredSharedList" :key="a.id" :xs="24" :sm="12" :md="8">
-          <el-card shadow="hover" class="agent-card">
-            <div class="agent-card-head" :style="{ background: theme(a.slug).bg }">
-              <div class="agent-icon" :style="{ color: theme(a.slug).color }">{{ a.name.charAt(0) }}</div>
-              <div style="display: flex; gap: 4px; flex-wrap: wrap">
-                <el-tag type="success" size="small">共享</el-tag>
-                <el-tag v-if="a.is_owner" size="small" type="warning">我的</el-tag>
-              </div>
+      <div class="agent-grid">
+        <el-card v-for="a in filteredSharedList" :key="a.id" shadow="hover" class="agent-card">
+          <div class="agent-card-head" :style="{ background: theme(a.slug).bg }">
+            <div class="agent-icon" :style="{ color: theme(a.slug).color }">{{ a.name.charAt(0) }}</div>
+            <div style="display: flex; gap: 4px; flex-wrap: wrap">
+              <el-tag type="success" size="small">共享</el-tag>
+              <el-tag v-if="a.is_owner" size="small" type="warning">我的</el-tag>
             </div>
-            <h3>{{ a.name }}</h3>
-            <p class="agent-intro">{{ a.intro }}</p>
-            <p class="shared-hint">含共享资料库、题库与考核配置</p>
-            <div class="agent-meta">
-              <el-tag size="small" type="info">{{ slugLabel(a.slug) }}</el-tag>
-              <span class="course-name">{{ a.course_name || '未绑定课程' }}</span>
-              <span class="owner-tag">· {{ a.owner_name }}</span>
-              <el-tag
-                v-if="a.is_owner && (a.adopter_count || 0) > 0"
-                size="small"
-                type="warning"
-                style="margin-left: 4px"
-              >已采纳 {{ a.adopter_count }}</el-tag>
-            </div>
-            <div class="shared-card-actions">
-              <el-button text type="primary" size="small" @click="viewSharedAgent(a)">查看详情</el-button>
-              <el-button text type="success" size="small" @click="experienceSharedAgent(a)">体验功能</el-button>
-              <el-button
-                v-if="a.is_owner"
-                text
-                type="warning"
-                size="small"
-                @click="openAdopters(a)"
-              >使用情况</el-button>
-              <el-button
-                type="primary"
-                size="small"
-                :disabled="a.is_owner"
-                @click="a.already_adopted ? goToAdopted(a) : adoptAgent(a)"
-              >{{ a.is_owner ? '我的智能体' : a.already_adopted ? '已加入管理' : '加入我的管理' }}</el-button>
-            </div>
-          </el-card>
-        </el-col>
-      </el-row>
+          </div>
+          <h3>{{ a.name }}</h3>
+          <p class="agent-intro">{{ a.intro || '暂无介绍' }}</p>
+          <p class="shared-hint">含共享资料库、题库与考核配置</p>
+          <div class="agent-meta">
+            <el-tag size="small" type="info">{{ slugLabel(a.slug) }}</el-tag>
+            <span class="course-name">{{ a.course_name || '未绑定课程' }}</span>
+            <span class="owner-tag">· {{ a.owner_name }}</span>
+            <el-tag
+              v-if="a.is_owner && (a.adopter_count || 0) > 0"
+              size="small"
+              type="warning"
+              style="margin-left: 4px"
+            >已采纳 {{ a.adopter_count }}</el-tag>
+          </div>
+          <div class="shared-card-actions">
+            <el-button text type="primary" size="small" @click="viewSharedAgent(a)">查看详情</el-button>
+            <el-button text type="success" size="small" @click="experienceSharedAgent(a)">体验功能</el-button>
+            <el-button
+              v-if="a.is_owner"
+              text
+              type="warning"
+              size="small"
+              @click="openAdopters(a)"
+            >使用情况</el-button>
+            <el-button
+              type="primary"
+              size="small"
+              :disabled="a.is_owner"
+              @click="a.already_adopted ? goToAdopted(a) : adoptAgent(a)"
+            >{{ a.is_owner ? '我的智能体' : a.already_adopted ? '已加入管理' : '加入我的管理' }}</el-button>
+          </div>
+        </el-card>
+      </div>
       <el-empty
         v-if="!filteredSharedList.length"
         :description="courseFilter || sharedLangFilter ? '当前筛选条件下暂无智能体' : '共享广场暂无智能体'"
@@ -597,19 +599,20 @@ onMounted(() => {
       <el-form label-width="80px">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="介绍"><el-input v-model="form.intro" type="textarea" :rows="3" /></el-form-item>
-        <el-form-item label="课程">
+        <el-form-item label="课程" required>
           <el-select
             :model-value="form.course_id"
             filterable
             allow-create
             default-first-option
             clearable
-            placeholder="选择已有课程，或直接输入新课程名称"
+            placeholder="选择或输入课程名（必填）"
             style="width: 100%"
             @update:model-value="onAgentCourseChange"
           >
             <el-option v-for="c in courses" :key="c.id" :label="c.name" :value="c.id" />
           </el-select>
+          <div class="form-tip">可直接输入新课程名创建；智能体将按课程分类管理</div>
         </el-form-item>
         <el-form-item label="语言" required>
           <el-select
@@ -702,29 +705,143 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.agent-manage { max-width: 1100px; }
-.header-card { margin-bottom: 20px; background: linear-gradient(135deg, #f5f7fa 0%, #fff 70%); }
-.page-title { margin: 0 0 8px; font-size: 22px; }
-.page-desc { margin: 0; color: #606266; line-height: 1.6; }
-.filter-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.agent-manage {
+  width: 100%;
+  max-width: 1280px;
+  margin: 0 auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.header-card {
+  margin-bottom: 14px;
+  flex-shrink: 0;
+  background: linear-gradient(135deg, #f5f7fa 0%, #fff 70%);
+  border: 1px solid #ebeef5;
+}
+.header-card :deep(.el-card__body) {
+  padding: 16px 20px;
+}
+.page-title { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
+.page-desc { margin: 0; color: #606266; line-height: 1.55; font-size: 13px; }
+.filter-bar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  flex-shrink: 0;
+}
 .filter-bar-left { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-.agent-card { cursor: pointer; margin-bottom: 16px; transition: transform 0.15s; height: calc(100% - 16px); }
-.agent-card:hover { transform: translateY(-3px); }
-.agent-card-head { display: flex; justify-content: space-between; align-items: center; margin: -20px -20px 12px; padding: 16px 20px; border-radius: 4px 4px 0 0; }
-.agent-icon { width: 44px; height: 44px; border-radius: 10px; background: #fff; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 700; }
-.agent-card h3 { margin: 0 0 8px; font-size: 17px; }
-.agent-intro { color: #606266; font-size: 13px; line-height: 1.6; min-height: 62px; margin: 0; }
-.agent-meta { margin-top: 10px; font-size: 12px; }
+.agent-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  align-items: stretch;
+}
+.agent-card {
+  cursor: pointer;
+  margin-bottom: 0;
+  transition: transform 0.15s;
+  height: 100%;
+  border: 1px solid #ebeef5;
+}
+.agent-card:hover { transform: translateY(-2px); }
+.agent-card :deep(.el-card__body) {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 0 16px 16px;
+}
+.agent-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 0 -16px 12px;
+  padding: 14px 16px;
+  border-radius: 4px 4px 0 0;
+}
+.agent-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 700;
+}
+.agent-card h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.agent-intro {
+  color: #606266;
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: calc(1.55em * 3);
+  flex: 1;
+}
+.agent-meta {
+  margin-top: 10px;
+  font-size: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 0;
+}
 .course-name { color: #409eff; }
 .owner-tag { color: #909399; }
-.enter-hint { display: inline-block; margin-top: 12px; font-size: 13px; color: #409eff; }
+.enter-hint {
+  display: inline-block;
+  margin-top: auto;
+  padding-top: 12px;
+  font-size: 13px;
+  color: #409eff;
+}
 .course-group { margin-bottom: 20px; }
+.course-group-title {
+  margin: 0 0 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #606266;
+}
 .shared-hint { margin: 0 0 8px; font-size: 12px; color: #67c23a; }
 .shared-card-actions {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  margin-top: 12px;
+  margin-top: auto;
+  padding-top: 12px;
+}
+.form-tip {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.4;
+}
+@media (max-width: 1100px) {
+  .agent-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 640px) {
+  .agent-grid {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

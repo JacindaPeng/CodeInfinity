@@ -23,11 +23,20 @@ http.interceptors.request.use((config) => {
 http.interceptors.response.use(
   (resp) => resp,
   (err) => {
-    let msg = err?.response?.data?.detail || err.message || '请求失败'
+    const detail = err?.response?.data?.detail
+    let msg =
+      (typeof detail === 'string' && detail) ||
+      (Array.isArray(detail) && detail.map((d: any) => d?.msg || d).join('; ')) ||
+      err.message ||
+      '请求失败'
+    const status = err?.response?.status
     if (err?.code === 'ECONNABORTED' || /timeout/i.test(err?.message || '')) {
       msg = '请求超时：教材拆分与索引耗时较长，请稍候再试；若后端正在重启请运行 backend\\dev.bat'
     } else if (!err?.response) {
       msg = '无法连接后端服务，请确认 backend 已在 8000 端口运行'
+    } else if ((status === 500 || status === 502) && (!detail || typeof detail !== 'string')) {
+      // Vite 代理在后端未启动时常见为无 body 的 500
+      msg = '后端暂时不可用（请确认 backend 已在 8000 端口运行后刷新页面）'
     }
     if (err?.response?.status === 401) {
       try {

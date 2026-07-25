@@ -27,7 +27,8 @@ const running = ref(false)
 const list = ref<PushItem[]>([])
 const weakPoints = ref<string[]>([])
 const lang = ref<'zh' | 'en'>('zh')
-const resourceType = ref<'all' | 'article' | 'podcast' | 'video' | 'twitter'>('all')
+const category = ref<'all' | 'weak' | 'extended'>('all')
+const readStatus = ref<'all' | 'unread' | 'read'>('all')
 const limit = ref(3)
 
 const resourceLabels = {
@@ -41,11 +42,12 @@ function resourceLabel(type: string) {
   return resourceLabels[type as keyof typeof resourceLabels] || '文章'
 }
 
-/** 仅展示考核报告中的完整薄弱点；否则显示课程延伸阅读 */
+/** 薄弱点推荐只展示一个对应标签；延伸阅读显示课程延伸阅读 */
 function displayKpNames(row: PushItem): string[] {
   const official = new Set(weakPoints.value)
   const valid = (row.kp_names || []).filter(k => official.has(k))
-  return valid.length ? valid : ['课程延伸阅读']
+  if (valid.length) return [valid[0]]
+  return ['课程延伸阅读']
 }
 
 async function load() {
@@ -53,7 +55,10 @@ async function load() {
   try {
     const [pushRes, weakRes] = await Promise.all([
       http.get<PushItem[]>('/knowledge-push/today', {
-        params: { resource_type: resourceType.value },
+        params: {
+          category: category.value,
+          status: readStatus.value,
+        },
       }),
       http.get<{ items: { kp_name: string }[] }>('/knowledge-push/weak-points').catch(() => ({ data: { items: [] } })),
     ])
@@ -69,6 +74,9 @@ async function markRead(row: PushItem) {
   row.status = 'read'
   window.dispatchEvent(new CustomEvent('knowledge-push-changed'))
   ElMessage.success('已标记已读')
+  if (readStatus.value === 'unread') {
+    list.value = list.value.filter(x => x.id !== row.id)
+  }
 }
 
 async function dismiss(row: PushItem) {
@@ -96,14 +104,13 @@ async function runNow() {
         fetch: true,
         for_me: true,
         lang: lang.value,
-        resource_type: resourceType.value,
+        resource_type: 'all',
         limit: limit.value,
       },
       { timeout: 60000, skipGlobalError: true },
     )
     if (data.weak_points?.length) weakPoints.value = data.weak_points
-    const typeText = resourceType.value === 'all' ? '综合' : resourceLabel(resourceType.value)
-    ElMessage.success(`已生成 ${data.pushes_created || 0} 条${lang.value === 'zh' ? '中文' : '英文'}${typeText}推送`)
+    ElMessage.success(`已生成 ${data.pushes_created || 0} 条${lang.value === 'zh' ? '中文' : '英文'}推送`)
     if (!(data.pushes_created > 0)) {
       ElMessage.warning(
         lang.value === 'zh'
@@ -131,30 +138,50 @@ onMounted(load)
 <template>
   <el-card shadow="never" v-loading="loading">
     <template #header>
-      <div class="header-row">
-        <div>
-          <div style="font-weight: 600; font-size: 16px">知识推送</div>
-          <div style="color: #909399; font-size: 13px; margin-top: 4px">
-            根据薄弱点进行推荐，或从白名单博客推荐课外延伸阅读
-          </div>
+      <div class="page-head">
+        <div class="page-head__title">
+          <h2>知识推送</h2>
+          <p>根据薄弱点进行推荐，或从白名单博客推荐课外延伸阅读</p>
         </div>
-        <div class="controls">
-          <span class="ctrl-label">语言</span>
-          <el-radio-group v-model="lang" size="small">
-            <el-radio-button value="zh">中文</el-radio-button>
-            <el-radio-button value="en">英文</el-radio-button>
-          </el-radio-group>
-          <span class="ctrl-label">类型</span>
-          <el-select v-model="resourceType" size="small" style="width: 100px" @change="load">
-            <el-option label="全部" value="all" />
-            <el-option label="文章" value="article" />
-            <el-option label="播客" value="podcast" />
-            <el-option label="视频" value="video" />
-            <el-option label="推文" value="twitter" />
-          </el-select>
-          <span class="ctrl-label">条数</span>
-          <el-input-number v-model="limit" :min="1" :max="10" size="small" controls-position="right" />
-          <el-button :loading="running" type="primary" @click="runNow">刷新今日推荐</el-button>
+        <div class="toolbar">
+          <div class="toolbar-panel">
+            <div class="toolbar-panel__label">筛选</div>
+            <div class="toolbar-panel__body">
+              <div class="field">
+                <span class="field__label">状态</span>
+                <el-radio-group v-model="readStatus" size="small" @change="load">
+                  <el-radio-button value="all">全部</el-radio-button>
+                  <el-radio-button value="unread">未读</el-radio-button>
+                  <el-radio-button value="read">已读</el-radio-button>
+                </el-radio-group>
+              </div>
+              <div class="field">
+                <span class="field__label">类型</span>
+                <el-select v-model="category" size="small" style="width: 148px" @change="load">
+                  <el-option label="全部" value="all" />
+                  <el-option label="课外扩展阅读" value="extended" />
+                  <el-option label="薄弱点" value="weak" />
+                </el-select>
+              </div>
+            </div>
+          </div>
+          <div class="toolbar-panel toolbar-panel--accent">
+            <div class="toolbar-panel__label">生成推荐</div>
+            <div class="toolbar-panel__body">
+              <div class="field">
+                <span class="field__label">语言</span>
+                <el-radio-group v-model="lang" size="small">
+                  <el-radio-button value="zh">中文</el-radio-button>
+                  <el-radio-button value="en">英文</el-radio-button>
+                </el-radio-group>
+              </div>
+              <div class="field">
+                <span class="field__label">条数</span>
+                <el-input-number v-model="limit" :min="1" :max="10" size="small" controls-position="right" />
+              </div>
+              <el-button :loading="running" type="primary" @click="runNow">刷新今日推荐</el-button>
+            </div>
+          </div>
         </div>
       </div>
     </template>
@@ -198,22 +225,67 @@ onMounted(load)
 </template>
 
 <style scoped>
-.header-row {
+.page-head {
   display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 14px;
 }
-.controls {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+.page-head__title h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: #303133;
+  letter-spacing: 0.02em;
 }
-.ctrl-label {
+.page-head__title p {
+  margin: 6px 0 0;
   color: #909399;
   font-size: 13px;
+  line-height: 1.5;
+}
+.toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+  gap: 12px;
+}
+.toolbar-panel {
+  border: 1px solid #ebeef5;
+  border-radius: 10px;
+  background: #fafbfc;
+  padding: 10px 12px;
+  min-width: 0;
+}
+.toolbar-panel--accent {
+  background: linear-gradient(180deg, #f0f7ff 0%, #f7faff 100%);
+  border-color: #d6e8ff;
+}
+.toolbar-panel__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #606266;
+  margin-bottom: 8px;
+  letter-spacing: 0.04em;
+}
+.toolbar-panel__body {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+.field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.field__label {
+  color: #909399;
+  font-size: 12px;
+  white-space: nowrap;
+}
+@media (max-width: 900px) {
+  .toolbar {
+    grid-template-columns: 1fr;
+  }
 }
 .weak-box {
   margin-bottom: 14px;

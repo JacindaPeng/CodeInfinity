@@ -18,6 +18,7 @@ chroma/
 .idea/
 .vscode/
 *.log
+*.mp4
 
 # 临时 / 误生成文件
 *_preview.txt

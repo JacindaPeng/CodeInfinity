@@ -20,7 +20,7 @@ from ..models import (
 from ..services import recommend_service
 from ..services.enrollment import get_student_class_for_course
 from ..services.llm_provider import get_provider
-from ..services.rag_service import retrieve, _build_context
+from ..services.rag_service import retrieve_async, _build_context
 from ..services.exam_service import compute_total_score
 
 REWARD_AGREE = 1
@@ -125,7 +125,7 @@ async def prepare_question_ask(
     if not q:
         raise ValueError("题目不存在")
     search_q = f"{q.stem} {q.kp_name or ''} {question}".strip()
-    hits = retrieve(
+    hits = await retrieve_async(
         search_q,
         chapter_id=exam.chapter_id,
         class_ids=class_ids,

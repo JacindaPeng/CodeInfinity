@@ -150,30 +150,40 @@ function go(path: string) {
       </div>
     </el-card>
 
-    <section v-if="learnFeatures.length" class="feature-section">
-      <h3 class="section-title">学习与问答</h3>
-      <el-row :gutter="16">
-        <el-col v-for="f in learnFeatures" :key="f.path" :xs="24" :sm="12" :md="8" :lg="6">
-          <el-card shadow="hover" class="feature-card" @click="go(f.path)">
+    <div class="home-body">
+      <section v-if="learnFeatures.length" class="feature-section">
+        <h3 class="section-title">学习与问答</h3>
+        <div class="feature-grid" :style="{ '--cols': Math.min(learnFeatures.length, 4) }">
+          <el-card
+            v-for="f in learnFeatures"
+            :key="f.path"
+            shadow="hover"
+            class="feature-card"
+            @click="go(f.path)"
+          >
             <div class="feature-icon" :style="{ background: f.color + '18', color: f.color }">
-              <el-icon :size="28"><component :is="f.icon" /></el-icon>
+              <el-icon :size="26"><component :is="f.icon" /></el-icon>
             </div>
             <h4>{{ f.title }}</h4>
             <p>{{ f.desc }}</p>
             <span class="feature-link">进入 →</span>
           </el-card>
-        </el-col>
-      </el-row>
-    </section>
+        </div>
+      </section>
 
-    <section v-if="!isAdmin" class="feature-section">
-      <h3 class="section-title">核心能力</h3>
-      <el-row :gutter="16">
-        <el-col v-for="f in highlightFeatures" :key="f.path" :xs="24" :sm="12">
-          <el-card shadow="hover" class="feature-card feature-card-wide" @click="go(f.path)">
+      <section v-if="!isAdmin" class="feature-section">
+        <h3 class="section-title">核心能力</h3>
+        <div class="feature-grid feature-grid--wide" :style="{ '--cols': highlightFeatures.length }">
+          <el-card
+            v-for="f in highlightFeatures"
+            :key="f.path"
+            shadow="hover"
+            class="feature-card feature-card-wide"
+            @click="go(f.path)"
+          >
             <div class="feature-row">
               <div class="feature-icon" :style="{ background: f.color + '18', color: f.color }">
-                <el-icon :size="28"><component :is="f.icon" /></el-icon>
+                <el-icon :size="26"><component :is="f.icon" /></el-icon>
               </div>
               <div class="feature-body">
                 <h4>{{ f.title }}</h4>
@@ -182,94 +192,140 @@ function go(path: string) {
               </div>
             </div>
           </el-card>
-        </el-col>
-      </el-row>
-    </section>
+        </div>
+      </section>
 
-    <section v-if="teachFeatures.length" class="feature-section">
-      <h3 class="section-title">教学管理</h3>
-      <el-row :gutter="16">
-        <el-col v-for="f in teachFeatures" :key="f.path" :xs="24" :sm="12" :md="8" :lg="6">
-          <el-card shadow="hover" class="feature-card" @click="go(f.path)">
+      <section v-if="teachFeatures.length" class="feature-section">
+        <h3 class="section-title">教学管理</h3>
+        <div class="feature-grid" :style="{ '--cols': Math.min(teachFeatures.length, 4) }">
+          <el-card
+            v-for="f in teachFeatures"
+            :key="f.path"
+            shadow="hover"
+            class="feature-card"
+            @click="go(f.path)"
+          >
             <div class="feature-icon" :style="{ background: f.color + '18', color: f.color }">
-              <el-icon :size="28"><component :is="f.icon" /></el-icon>
+              <el-icon :size="26"><component :is="f.icon" /></el-icon>
             </div>
             <h4>{{ f.title }}</h4>
             <p>{{ f.desc }}</p>
             <span class="feature-link">进入 →</span>
           </el-card>
-        </el-col>
-      </el-row>
-    </section>
+        </div>
+      </section>
 
-    <section v-if="adminFeatures.length" class="feature-section">
-      <h3 class="section-title">系统管理</h3>
-      <el-row :gutter="16">
-        <el-col v-for="f in adminFeatures" :key="f.path" :xs="24" :sm="12" :md="8" :lg="6">
-          <el-card shadow="hover" class="feature-card" @click="go(f.path)">
+      <section v-if="adminFeatures.length" class="feature-section">
+        <h3 class="section-title">系统管理</h3>
+        <div class="feature-grid" :style="{ '--cols': Math.min(adminFeatures.length, 4) }">
+          <el-card
+            v-for="f in adminFeatures"
+            :key="f.path"
+            shadow="hover"
+            class="feature-card"
+            @click="go(f.path)"
+          >
             <div class="feature-icon" :style="{ background: f.color + '18', color: f.color }">
-              <el-icon :size="28"><component :is="f.icon" /></el-icon>
+              <el-icon :size="26"><component :is="f.icon" /></el-icon>
             </div>
             <h4>{{ f.title }}</h4>
             <p>{{ f.desc }}</p>
             <span class="feature-link">进入 →</span>
           </el-card>
-        </el-col>
-      </el-row>
-    </section>
+        </div>
+      </section>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .home-page {
-  max-width: 1200px;
+  width: 100%;
+  max-width: 1280px;
+  margin: 0 auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .welcome-card {
-  margin-bottom: 20px;
+  margin-bottom: 0;
+  flex-shrink: 0;
   background: linear-gradient(135deg, #f0f7ff 0%, #fff 60%);
+  border: 1px solid #ebeef5;
+}
+.welcome-card :deep(.el-card__body) {
+  padding: 18px 22px;
 }
 .welcome-inner {
   display: flex;
   justify-content: space-between;
-  align-items: flex-end;
+  align-items: center;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 10px;
 }
 .welcome-title {
   margin: 0;
-  font-size: 22px;
+  font-size: 20px;
   color: #303133;
+  font-weight: 600;
 }
 .welcome-sub {
-  margin: 8px 0 0;
+  margin: 6px 0 0;
   color: #606266;
+  font-size: 14px;
 }
 .welcome-hint {
   margin: 0;
   font-size: 13px;
   color: #909399;
 }
+.home-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-top: 16px;
+  padding-bottom: 8px;
+}
 .feature-section {
-  margin-bottom: 24px;
+  margin-bottom: 0;
 }
 .section-title {
-  margin: 0 0 12px 4px;
-  font-size: 15px;
+  margin: 0 0 10px 2px;
+  font-size: 14px;
   font-weight: 600;
-  color: #303133;
+  color: #606266;
+  letter-spacing: 0.02em;
+}
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--cols, 4), minmax(0, 1fr));
+  gap: 14px;
+  align-items: stretch;
+}
+.feature-grid--wide {
+  grid-template-columns: repeat(var(--cols, 2), minmax(0, 1fr));
 }
 .feature-card {
   cursor: pointer;
-  margin-bottom: 16px;
+  margin-bottom: 0;
   transition: transform 0.15s, box-shadow 0.15s;
-  height: calc(100% - 16px);
+  height: 100%;
+  border: 1px solid #ebeef5;
 }
 .feature-card:hover {
   transform: translateY(-2px);
 }
+.feature-card :deep(.el-card__body) {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+}
 .feature-card h4 {
   margin: 12px 0 6px;
-  font-size: 16px;
+  font-size: 15px;
   color: #303133;
 }
 .feature-card p {
@@ -277,34 +333,56 @@ function go(path: string) {
   font-size: 13px;
   line-height: 1.5;
   color: #909399;
-  min-height: 40px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  flex: 1;
+  min-height: 39px;
 }
 .feature-link {
   display: inline-block;
-  margin-top: 10px;
+  margin-top: 12px;
   font-size: 13px;
   color: #409eff;
 }
 .feature-icon {
-  width: 52px;
-  height: 52px;
+  width: 48px;
+  height: 48px;
   border-radius: 12px;
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
 }
 .feature-card-wide .feature-row {
   display: flex;
-  gap: 16px;
+  gap: 14px;
   align-items: flex-start;
+  height: 100%;
 }
 .feature-body {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 .feature-body h4 {
   margin-top: 0;
 }
 .feature-body p {
   min-height: auto;
+  -webkit-line-clamp: 2;
+}
+@media (max-width: 1100px) {
+  .feature-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 640px) {
+  .feature-grid,
+  .feature-grid--wide {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

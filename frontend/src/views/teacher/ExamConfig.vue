@@ -21,9 +21,12 @@ const classes = ref<ClassItem[]>([])
 const kps = ref<KP[]>([])
 const selectedChapter = ref<number | undefined>(undefined)
 const selectedClasses = ref<number[]>([])
-const config = reactive<{ 选择题: number; 判断题: number; 简答题: number; knowledge_points: string[] }>({
-  选择题: 2, 判断题: 2, 简答题: 1, knowledge_points: [],
+const config = reactive<{ 选择题: number; 判断题: number; 填空题: number; 简答题: number; knowledge_points: string[] }>({
+  选择题: 2, 判断题: 2, 填空题: 0, 简答题: 1, knowledge_points: [],
 })
+const totalQuestions = computed(
+  () => config.选择题 + config.判断题 + config.填空题 + config.简答题,
+)
 const maxAttempts = ref(0)
 const allKpNames = ref<string[]>([])
 const saving = ref(false)
@@ -96,6 +99,7 @@ async function loadChapter() {
   const c = cfg.data.config || {}
   config.选择题 = c['选择题'] ?? 2
   config.判断题 = c['判断题'] ?? 2
+  config.填空题 = c['填空题'] ?? 0
   config.简答题 = c['简答题'] ?? 1
   config.knowledge_points = c['knowledge_points'] || []
   maxAttempts.value = cfg.data.max_attempts ?? 0
@@ -116,6 +120,7 @@ async function save() {
       config: {
         选择题: Number(config.选择题),
         判断题: Number(config.判断题),
+        填空题: Number(config.填空题),
         简答题: Number(config.简答题),
         knowledge_points: config.knowledge_points,
       },
@@ -297,6 +302,9 @@ onMounted(async () => {
       <el-form-item label="判断题数量">
         <el-input-number v-model="config.判断题" :min="0" :max="20" />
       </el-form-item>
+      <el-form-item label="填空题数量">
+        <el-input-number v-model="config.填空题" :min="0" :max="20" />
+      </el-form-item>
       <el-form-item label="简答题数量">
         <el-input-number v-model="config.简答题" :min="0" :max="10" />
       </el-form-item>
@@ -304,7 +312,7 @@ onMounted(async () => {
         <el-select v-model="config.knowledge_points" multiple placeholder="选择考核知识点" style="width: 100%">
           <el-option v-for="n in allKpNames" :key="n" :label="n" :value="n" />
         </el-select>
-        <div style="color: #999; font-size: 12px">总题数：{{ config.选择题 + config.判断题 + config.简答题 }}</div>
+        <div style="color: #999; font-size: 12px">总题数：{{ totalQuestions }}</div>
       </el-form-item>
       <el-form-item label="考核次数上限">
         <el-input-number v-model="maxAttempts" :min="0" :max="100" />

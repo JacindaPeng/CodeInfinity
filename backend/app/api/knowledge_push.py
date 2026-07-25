@@ -185,6 +185,14 @@ def unread_count(
     return {"count": n}
 
 
+_EXTENDED_KP_LABELS = frozenset({"课程延伸阅读", "延伸阅读"})
+
+
+def _is_extended_push(p: KnowledgePush) -> bool:
+    hits = list(p.kp_names_json or [])
+    return (not hits) or all(h in _EXTENDED_KP_LABELS for h in hits)
+
+
 @router.get("/today")
 def list_today(
     user: CurrentUser,
@@ -192,6 +200,8 @@ def list_today(
     agent_id: int | None = Query(default=None),
     course_id: int | None = Query(default=None),
     include_read: bool = Query(default=True),
+    status: str = Query(default="all", description="all | unread | read"),
+    category: str = Query(default="all", description="all | weak | extended"),
     resource_type: str = Query(default="all"),
 ) -> list[dict]:
     # 纠正历史误标（如把 python 当成薄弱点）
@@ -200,6 +210,11 @@ def list_today(
         _weak_keyword_set,
     )
     from ..services.weakness_service import resolve_student_weak_targets
+
+    if status not in ("all", "unread", "read"):
+        raise HTTPException(400, "不支持的阅读状态")
+    if category not in ("all", "weak", "extended"):
+        raise HTTPException(400, "不支持的推荐分类")
 
     targets = resolve_student_weak_targets(db, user, all_courses=True)
     if _sanitize_false_weak_reasons(db, user.id, _weak_keyword_set(targets)):
@@ -216,8 +231,10 @@ def list_today(
         .order_by(KnowledgePush.pushed_at.desc())
         .limit(100)
     )
-    if not include_read:
+    if status == "unread" or not include_read:
         q = q.where(KnowledgePush.status == "unread")
+    elif status == "read":
+        q = q.where(KnowledgePush.status == "read")
     if agent_id is not None:
         q = q.where(KnowledgePush.agent_id == agent_id)
     if course_id is not None:
@@ -230,6 +247,10 @@ def list_today(
         )
         q = q.where(KnowledgePush.article_id.in_(article_ids))
     rows = db.scalars(q).all()
+    if category == "extended":
+        rows = [p for p in rows if _is_extended_push(p)]
+    elif category == "weak":
+        rows = [p for p in rows if not _is_extended_push(p)]
     return [_push_out(p) for p in rows]
 
 

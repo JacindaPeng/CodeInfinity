@@ -35,6 +35,7 @@ from ..services.chapter_sync import (
     uses_course_level_preset_chapters,
 )
 from ..services.indexer import index_material, index_pdf_pages, _build_page_offset_map
+from ..services.storage_paths import portable_upload_path, resolve_upload_path, stored_filename
 
 router = APIRouter(prefix="/materials", tags=["materials"])
 
@@ -51,11 +52,12 @@ def _save_upload(file: UploadFile) -> str:
     if ext not in ALLOWED:
         raise HTTPException(400, f"不支持的文件类型: {ext}")
     Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
-    safe_name = f"{int(__import__('time').time())}_{Path(file.filename).name}"
+    safe_name = f"{int(__import__('time').time())}_{Path(file.filename or 'file').name}"
     dest = Path(settings.upload_dir) / safe_name
     with dest.open("wb") as f:
         f.write(file.file.read())
-    return str(dest.resolve())
+    # 写入当前 UPLOAD_DIR 下的绝对路径，读取时再用 resolve_upload_path 兼容跨环境
+    return portable_upload_path(safe_name)
 
 
 @router.get("")
@@ -104,7 +106,7 @@ def list_materials(
         {
             "id": m.id, "chapter_id": m.chapter_id, "class_id": m.class_id,
             "type": m.type,
-            "title": m.title, "file_path": m.file_path, "file_name": Path(m.file_path).name,
+            "title": m.title, "file_path": m.file_path, "file_name": stored_filename(m.file_path),
             "created_at": m.created_at.isoformat() if m.created_at else None,
         }
         for m in rows
@@ -248,6 +250,9 @@ def upload_textbook(
     prefix = title_prefix or Path(file.filename).stem
     results = []
     total_chunks = 0
+    index_errors: list[str] = []
+    # 先落库章节与资料元数据，再索引；避免 Chroma/ONNX 下载卡住导致整单回滚「看起来没生成章节」
+    material_jobs: list[tuple[Material, tuple[int, int], dict]] = []
     for cid in unique_class_ids:
         for sp in splits:
             material = Material(
@@ -259,25 +264,38 @@ def upload_textbook(
                 agent_id=resolved_agent_id,
                 meta_json={"page_start": sp["start_page"], "page_end": sp["end_page"]},
             )
-            db.add(material); db.flush()
-            chunks = index_pdf_pages(
-                db, material, pages_text, (sp["start_page"], sp["end_page"]), offset_map=offset_map
-            )
-            total_chunks += chunks
-            results.append({
+            db.add(material)
+            db.flush()
+            detail = {
                 "class_id": cid,
                 "chapter_id": sp["chapter_id"],
                 "chapter_title": sp["chapter_title"],
                 "page_range": f"{sp['start_page']}-{sp['end_page']}",
                 "material_id": material.id,
-                "chunks": chunks,
-            })
+                "chunks": 0,
+            }
+            results.append(detail)
+            material_jobs.append(
+                (material, (sp["start_page"], sp["end_page"]), detail)
+            )
 
     from ..services.agent_service import maybe_activate_course_agent
     maybe_activate_course_agent(db, course_id)
     db.commit()
 
-    return {
+    for material, page_range, detail in material_jobs:
+        try:
+            chunks = index_pdf_pages(
+                db, material, pages_text, page_range, offset_map=offset_map
+            )
+            detail["chunks"] = chunks
+            total_chunks += chunks
+        except Exception as e:
+            msg = f"{detail.get('chapter_title')}: {e}"
+            index_errors.append(msg)
+            detail["index_error"] = str(e)
+
+    out = {
         "ok": True,
         "course_id": course_id,
         "chapters_created": chapters_created,
@@ -287,6 +305,13 @@ def upload_textbook(
         "total_chunks": total_chunks,
         "details": results,
     }
+    if index_errors:
+        out["warning"] = (
+            "章节已生成，但向量索引未完成（常见于 Docker 首次下载 Chroma ONNX 模型过慢）。"
+            "请稍后点击「重建索引」，或确认容器已预热 embedding 模型。"
+        )
+        out["index_errors"] = index_errors[:8]
+    return out
 
 
 @router.post("/upload-courseware-batch", dependencies=[Depends(require_role("teacher", "admin"))])
@@ -352,6 +377,8 @@ def upload_courseware_batch(
 
         results = []
         total_chunks = 0
+        index_errors: list[str] = []
+        index_jobs: list[tuple[Material, str]] = []
         for item in plan:
             file_idx = item["file_index"]
             path = saved_paths[file_idx]
@@ -361,7 +388,6 @@ def upload_courseware_batch(
                 raise HTTPException(400, f"不支持的文件类型: {ext}")
             chapter_id = order_to_id[item["order_idx"]]
             title = item["title"]
-            file_chunks = 0
             material_ids: list[int] = []
             for cid in unique_class_ids:
                 material = Material(
@@ -374,25 +400,32 @@ def upload_courseware_batch(
                 )
                 db.add(material)
                 db.flush()
-                try:
-                    chunks = index_material(db, material)
-                except Exception as e:
-                    raise HTTPException(500, f"索引失败（{uf.filename}）: {e}") from e
-                file_chunks += chunks
                 material_ids.append(material.id)
-            total_chunks += file_chunks
+                index_jobs.append((material, uf.filename or title))
             results.append({
                 "chapter_id": chapter_id,
                 "chapter_title": item["title"],
                 "file_name": uf.filename,
                 "parse_source": item["parse_source"],
                 "material_ids": material_ids,
-                "chunks": file_chunks,
+                "chunks": 0,
             })
 
         from ..services.agent_service import maybe_activate_course_agent
         maybe_activate_course_agent(db, course_id)
+        # 先提交章节结构，避免索引阶段失败导致「章节未生成」
         db.commit()
+
+        chunks_by_material: dict[int, int] = {}
+        for material, fname in index_jobs:
+            try:
+                chunks_by_material[material.id] = index_material(db, material)
+                total_chunks += chunks_by_material[material.id]
+            except Exception as e:
+                index_errors.append(f"{fname}: {e}")
+                chunks_by_material[material.id] = 0
+        for row in results:
+            row["chunks"] = sum(chunks_by_material.get(mid, 0) for mid in row["material_ids"])
     except Exception:
         db.rollback()
         for path in saved_paths:
@@ -403,7 +436,7 @@ def upload_courseware_batch(
                 pass
         raise
 
-    return {
+    out = {
         "ok": True,
         "course_id": course_id,
         "chapters_created": len(chapter_rows),
@@ -411,6 +444,13 @@ def upload_courseware_batch(
         "total_chunks": total_chunks,
         "details": results,
     }
+    if index_errors:
+        out["warning"] = (
+            "章节已生成，但部分资料索引失败（Docker 首次下载 embedding 模型过慢时常见）。"
+            "可稍后点击「重建索引」。"
+        )
+        out["index_errors"] = index_errors[:8]
+    return out
 
 
 @router.delete("/{material_id}", dependencies=[Depends(require_role("teacher", "admin"))])
@@ -425,8 +465,9 @@ def delete_material(material_id: int, user: CurrentUser, db: DBSession) -> dict:
     ))
     if not other_refs:
         try:
-            if os.path.exists(m.file_path):
-                os.unlink(m.file_path)
+            resolved = resolve_upload_path(m.file_path)
+            if resolved is not None:
+                resolved.unlink()
         except OSError:
             pass
     vector_store.delete_by_material(material_id)
@@ -462,7 +503,7 @@ def re_split_textbook(user: CurrentUser, db: DBSession) -> dict:
     total_deleted = 0
 
     for fp in file_paths:
-        if not os.path.exists(fp):
+        if resolve_upload_path(fp) is None:
             continue
         materials = db.scalars(
             select(Material).where(Material.file_path == fp, Material.type == "pdf")
@@ -498,7 +539,11 @@ def re_split_textbook(user: CurrentUser, db: DBSession) -> dict:
 
     for fp, orig_materials in textbook_file_paths:
         try:
-            pages_text, page_corners = extract_pdf_pages_with_corners(fp)
+            disk = resolve_upload_path(fp)
+            if disk is None:
+                results.append({"error": f"文件不存在: {stored_filename(fp)}"})
+                continue
+            pages_text, page_corners = extract_pdf_pages_with_corners(str(disk))
         except Exception as e:
             results.append({"error": f"读取PDF失败: {e}"})
             continue
@@ -580,7 +625,8 @@ def stats(user: CurrentUser, db: DBSession) -> dict:
 @router.get("/file/{material_id}")
 def get_file(material_id: int, user: CurrentUser, db: DBSession) -> FileResponse:
     m = db.get(Material, material_id)
-    if not m or not os.path.exists(m.file_path):
+    path = resolve_upload_path(m.file_path) if m else None
+    if not m or path is None:
         raise HTTPException(404, "文件不存在")
     assert_can_access_material(db, user, m)
-    return FileResponse(m.file_path, filename=Path(m.file_path).name)
+    return FileResponse(path, filename=stored_filename(m.file_path) or path.name)

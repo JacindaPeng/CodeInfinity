@@ -32,4 +32,5 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "python -m scripts.init_db && python -m scripts.run_migrations && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# hash 模式下跳过 ONNX 预热；仅 CHROMA_EMBEDDING_MODE=onnx/auto 时后台尝试下载
+CMD ["sh", "-c", "python -m scripts.init_db && python -m scripts.run_migrations && if [ \"$CHROMA_EMBEDDING_MODE\" = \"onnx\" ] || [ \"$CHROMA_EMBEDDING_MODE\" = \"auto\" ]; then (python -m scripts.warmup_chroma_onnx > /tmp/chroma_warmup.log 2>&1 &); fi && uvicorn app.main:app --host 0.0.0.0 --port 8000"]

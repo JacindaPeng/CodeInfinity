@@ -6,11 +6,19 @@ from sqlalchemy.orm import Session
 
 from ..models import Chapter, Material, VideoSegment
 from . import doc_parser, vector_store, video_service
+from .storage_paths import resolve_upload_path
 
 
 def _get_chapter_title(db: Session, chapter_id: int) -> str:
     ch = db.get(Chapter, chapter_id)
     return ch.title if ch else ""
+
+
+def _material_disk_path(material: Material) -> str:
+    path = resolve_upload_path(material.file_path)
+    if path is None:
+        raise FileNotFoundError(f"资料文件不存在: {material.file_path}")
+    return str(path)
 
 
 def index_material(db: Session, material: Material) -> int:
@@ -28,11 +36,12 @@ def index_material(db: Session, material: Material) -> int:
         "type": material.type,
         "title": material.title,
     }
+    disk_path = _material_disk_path(material)
 
     if material.type == "video":
         # 先清理旧 video_segments
         db.execute(delete(VideoSegment).where(VideoSegment.video_id == material.id))
-        result = video_service.process_video(material.file_path, base_meta)
+        result = video_service.process_video(disk_path, base_meta)
         for s in result["segments"]:
             db.add(VideoSegment(
                 video_id=material.id,
@@ -41,7 +50,7 @@ def index_material(db: Session, material: Material) -> int:
             ))
         chunks = result["chunks"]
     else:
-        chunks = doc_parser.parse_document(material.file_path, base_meta)
+        chunks = doc_parser.parse_document(disk_path, base_meta)
 
     if not chunks:
         db.commit()
