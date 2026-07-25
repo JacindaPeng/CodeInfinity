@@ -13,12 +13,12 @@
 | （1）前端 Vue 源码 | `frontend/` | ✅ |
 | （1）后端 Python 源码 | `backend/` | ✅ |
 | （2）SQLite 数据库 | 运行后生成 `data/course.db`（`init_db` / Docker 启动自动建库） | ✅ |
-| （3）系统设计 | [docs/系统设计.md](docs/系统设计.md) | ✅ |
-| （3）功能说明 | [docs/功能说明.md](docs/功能说明.md) | ✅ |
-| （3）数据结构设计 | [docs/数据结构设计.md](docs/数据结构设计.md) | ✅ |
-| （3）API 接口文档 | [docs/API接口文档.md](docs/API接口文档.md)（运行中见 `/docs` Swagger） | ✅ |
-| （3）课程设计报告（可选汇总） | `docs/专业方向课程设计报告.docx` | ✅ |
-| （4）演示视频 ≥10 分钟 | 口播稿见 `docs/演示视频/演示视频逐字稿.docx`，成品视频放入 `docs/演示视频/` | ⚠️ 按稿录制后提交 |
+| （3）系统设计 | [docs and video/Technical Specification/系统设计.md](docs%20and%20video/Technical%20Specification/系统设计.md) | ✅ |
+| （3）功能说明 | [docs and video/Technical Specification/功能说明.md](docs%20and%20video/Technical%20Specification/功能说明.md) | ✅ |
+| （3）数据结构设计 | [docs and video/Technical Specification/数据结构设计.md](docs%20and%20video/Technical%20Specification/数据结构设计.md) | ✅ |
+| （3）API 接口文档 | [docs and video/Technical Specification/API接口文档.md](docs%20and%20video/Technical%20Specification/API接口文档.md)（运行中见 `/docs` Swagger） | ✅ |
+| （3）课程设计报告（可选汇总） | `docs and video/Course Report/` | ✅ |
+| （4）演示视频 ≥10 分钟 | 口播稿与成品见 `docs and video/Demo Video/`（大文件 `*.mp4` 本地保留，未入库） | ✅ |
 | （5）README 部署说明 | 本文档 | ✅ |
 | （5）`docker-compose up` 一键启动 | 根目录 `docker-compose.yml` | ✅ |
 
@@ -60,8 +60,11 @@
 ├── backend/                 # FastAPI（venv、install.bat、dev.bat）
 ├── frontend/                # Vue3 SPA
 ├── data/                    # 运行时：course.db / chroma / uploads（自动生成）
-├── docs/                    # 系统设计、功能、数据结构、API、演示口播稿
-│   └── 演示视频/            # 逐字稿；演示成品视频放此处
+├── docs and video/          # 提交文档与演示材料
+│   ├── Technical Specification/  # 系统设计、功能、数据结构、API
+│   ├── Course Report/       # 课程设计报告
+│   ├── Presentation/        # 汇报 PPT
+│   └── Demo Video/          # 口播稿与演示成品视频（*.mp4 本地保留）
 ├── PL_Course/               # 课程原始资料（C / C++ / Python / SQL）
 ├── docker-compose.yml
 ├── .env.example             # Docker / 部署用环境变量模板
@@ -208,7 +211,7 @@ npm run dev
 1. 启动后打开 Swagger：`/docs`，确认存在认证、智能体问答、资料、考核、班级等路由。  
 2. 冒烟：`POST /api/auth/login` → `GET /api/users/me` → `GET /api/agents`。  
 3. 课程问答为 **SSE**：`POST /api/agents/course/ask`。  
-4. 完整清单见 [docs/API接口文档.md](docs/API接口文档.md)。  
+4. 完整清单见 [docs and video/Technical Specification/API接口文档.md](docs%20and%20video/Technical%20Specification/API接口文档.md)。  
 
 ---
 
@@ -216,12 +219,13 @@ npm run dev
 
 | 文档 | 内容 |
 |------|------|
-| [docs/系统设计.md](docs/系统设计.md) | 架构、模块、技术选型、RAG/权限设计 |
-| [docs/功能说明.md](docs/功能说明.md) | 角色功能、业务流程、权限矩阵 |
-| [docs/数据结构设计.md](docs/数据结构设计.md) | SQLite 表、Chroma 元数据、文件路径 |
-| [docs/API接口文档.md](docs/API接口文档.md) | REST / SSE 接口一览 |
-| [docs/演示视频/演示视频逐字稿.docx](docs/演示视频/演示视频逐字稿.docx) | ≥10 分钟演示口播稿 |
-| [docs/专业方向课程设计报告.docx](docs/专业方向课程设计报告.docx) | 正式报告汇总（如有） |
+| [系统设计.md](docs%20and%20video/Technical%20Specification/系统设计.md) | 架构、模块、技术选型、RAG/权限设计 |
+| [功能说明.md](docs%20and%20video/Technical%20Specification/功能说明.md) | 角色功能、业务流程、权限矩阵 |
+| [数据结构设计.md](docs%20and%20video/Technical%20Specification/数据结构设计.md) | SQLite 表、Chroma 元数据、文件路径 |
+| [API接口文档.md](docs%20and%20video/Technical%20Specification/API接口文档.md) | REST / SSE 接口一览 |
+| `docs and video/Demo Video/` | 演示口播稿与成品视频（`*.mp4` 本地保留） |
+| `docs and video/Course Report/` | 正式报告汇总 |
+| `docs and video/Presentation/` | 汇报 PPT |
 | [小学期课程实践项目说明书(1).docx](小学期课程实践项目说明书(1).docx) | 课程统一项目要求 |
 
 ---

@@ -11,6 +11,6 @@ chat_attachments/
 *.mp4
 *.pdf
 *.zip
-docs/演示视频/
+docs and video/Demo Video/
 backend/.env
 frontend/dist/
